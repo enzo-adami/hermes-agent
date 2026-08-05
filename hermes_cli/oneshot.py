@@ -50,6 +50,49 @@ def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
     return [item for item in normalized if item] or None
 
 
+def _normalize_skills(skills: object = None) -> list[str]:
+    """Normalize repeated and comma-separated ``--skills`` values."""
+    if not skills:
+        return []
+
+    raw_items = [skills] if isinstance(skills, str) else skills
+    if not isinstance(raw_items, (list, tuple)):
+        raw_items = [raw_items]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        for part in str(item).split(","):
+            name = part.strip()
+            if name and name not in seen:
+                seen.add(name)
+                normalized.append(name)
+    return normalized
+
+
+def _prepare_preloaded_skills(skills: object = None) -> tuple[str, str | None]:
+    """Build the same active-skill prompt used by normal CLI sessions."""
+    identifiers = _normalize_skills(skills)
+    if not identifiers:
+        return "", None
+
+    try:
+        from agent.skill_commands import build_preloaded_skills_prompt
+
+        prompt, loaded, missing = build_preloaded_skills_prompt(identifiers)
+    except Exception as exc:
+        return "", f"hermes -z: failed to preload --skills: {exc}\n"
+
+    if missing and not loaded:
+        return "", f"hermes -z: unknown or disabled skill(s): {', '.join(missing)}\n"
+    if missing:
+        sys.stderr.write(
+            "hermes -z: ignoring unknown or disabled skill(s): "
+            f"{', '.join(missing)}\n"
+        )
+    return prompt, None
+
+
 def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:
     normalized = _normalize_toolsets(toolsets)
     if normalized is None:
@@ -172,6 +215,7 @@ def run_oneshot(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
+    skills: object = None,
     usage_file: Optional[str] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
@@ -183,6 +227,7 @@ def run_oneshot(
         provider: Optional provider override. Falls back to config.yaml's
             model.provider, then "auto".
         toolsets: Optional comma-separated string or iterable of toolsets.
+        skills: Optional repeated/comma-separated skill identifiers to preload.
         usage_file: Optional path; when set, a JSON usage report (estimated
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
@@ -216,6 +261,11 @@ def run_oneshot(
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
 
+    skills_prompt, skills_error = _prepare_preloaded_skills(skills)
+    if skills_error:
+        sys.stderr.write(skills_error)
+        return 2
+
     # Auto-approve any shell / tool approvals.  Non-interactive by
     # definition — a prompt would hang forever.
     os.environ["HERMES_YOLO_MODE"] = "1"
@@ -248,6 +298,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    ephemeral_system_prompt=skills_prompt or None,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -325,6 +376,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    ephemeral_system_prompt: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -448,6 +500,7 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            ephemeral_system_prompt=ephemeral_system_prompt,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction
