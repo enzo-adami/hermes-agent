@@ -976,8 +976,40 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 
 
 # ---------------------------------------------------------------------------
-# Attachments — kanban_attach / kanban_attach_url / kanban_attachments
+# Attachments and artifacts — kanban_attach / kanban_attach_url / kanban_attachments
 # ---------------------------------------------------------------------------
+
+
+def test_attach_defaults_to_artifact_and_list_exposes_type(worker_env):
+    import base64
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    payload = b"generated report"
+    created = json.loads(
+        kt._handle_attach(
+            {
+                "filename": "report.txt",
+                "content_base64": base64.b64encode(payload).decode("ascii"),
+                "content_type": "text/plain",
+            }
+        )
+    )
+    assert created["ok"] is True
+    assert created["attachment_type"] == "artifact"
+
+    listed = json.loads(kt._handle_attachments({}))
+    assert listed["attachments"][0]["attachment_type"] == "artifact"
+
+    conn = kb.connect()
+    try:
+        artifact = kb.list_attachments(conn, worker_env)[0]
+        assert artifact.attachment_type == "artifact"
+        assert Path(artifact.stored_path).read_bytes() == payload
+    finally:
+        conn.close()
 
 
 @pytest.fixture
@@ -1130,6 +1162,7 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
     try:
         atts = kb.list_attachments(conn, worker_env)
         assert [a.filename for a in atts] == ["spec.pdf"]
+        assert atts[0].attachment_type == "artifact"
         assert atts[0].content_type == "application/pdf"
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
