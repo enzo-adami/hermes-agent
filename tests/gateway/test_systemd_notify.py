@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 
 import pytest
 
 
 @pytest.mark.skipif(
-    not hasattr(socket, "AF_UNIX"), reason="Unix datagram sockets are unavailable"
+    not sys.platform.startswith("linux"),
+    reason="Abstract AF_UNIX sockets are a Linux-only namespace",
 )
 def test_notify_supports_systemd_abstract_socket(monkeypatch):
     name = "\0hermes-test-notify"
