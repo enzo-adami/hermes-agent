@@ -615,6 +615,14 @@ def fetch_models_dev(
     """
     global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
 
+    # agent.offline (air-gapped / intranet deployments): never open a
+    # socket. Behave as if allow_network=False for every caller, including
+    # force_refresh, so the process lives entirely off disk/memory caches.
+    from hermes_cli.config import offline_mode_enabled
+
+    if offline_mode_enabled():
+        allow_network = False
+
     if not allow_network:
         if _models_dev_cache:
             return _models_dev_cache

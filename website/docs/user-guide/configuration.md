@@ -1014,6 +1014,20 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
+## Offline Mode (air-gapped deployments)
+
+On intranet / air-gapped networks, Hermes must never open an unsolicited outbound socket. Setting `agent.offline: true` suppresses the two network calls a cold Hermes process would otherwise make on its own:
+
+- the cold-cache `models.dev` registry fetch (model/provider metadata), which then lives entirely off its in-memory / disk caches
+- the banner update check (`git ls-remote` against upstream)
+
+```yaml
+agent:
+  offline: true   # Never touch the network unless the user asked for it (default: false)
+```
+
+Explicit refreshes of these two sources are suppressed as well — `fetch_models_dev(force_refresh=True)` and the `/version` update check both no-op, since in an air-gapped environment they can only fail. Other user-invoked network activity is unaffected: provider API calls, web search/extract tools, and the skills hub all still work. The setting is read live from `config.yaml`, so a long-lived gateway picks up an edit without a restart.
+
 ## Verify-on-Stop (coding verification)
 
 When enabled, Hermes refuses to accept a final answer on a turn where the agent edited code in a workspace but produced no fresh verification evidence (a passing test run, build, lint, etc.) — it injects a synthetic follow-up asking the agent to verify or explain why it can't. Doc/markdown/skill-only edits never trigger it, and the loop is bounded so it can never trap the agent.

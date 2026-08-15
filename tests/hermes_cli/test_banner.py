@@ -4,9 +4,22 @@ from unittest.mock import patch
 
 from rich.console import Console
 
+from hermes_constants import get_hermes_home
+
 import hermes_cli.banner as banner
 import model_tools
 import tools.mcp_tool
+
+
+def test_check_for_updates_returns_none_under_offline_mode():
+    """agent.offline: true must skip the update check's network path entirely."""
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "agent:\n  offline: true\n", encoding="utf-8"
+    )
+    with patch.object(banner.subprocess, "run", side_effect=AssertionError("no subprocess allowed")):
+        assert banner.check_for_updates() is None
 
 
 def test_cprint_falls_back_to_plain_print_when_prompt_toolkit_has_no_console(capsys):
