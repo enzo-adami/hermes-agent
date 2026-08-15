@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from agent.message_content import flatten_message_text
+from agent.tool_guardrails import canonical_tool_args
 
 
 REPETITION_NUDGE_MESSAGE = (
@@ -87,7 +88,12 @@ def assistant_turn_signature(assistant_msg: Mapping[str, Any]) -> str:
         fn = tc.get("function") or {}
         if not isinstance(fn, Mapping):
             fn = {}
-        calls.append((str(fn.get("name") or ""), str(fn.get("arguments") or "")))
+        calls.append(
+            (
+                str(fn.get("name") or ""),
+                _canonical_tool_arguments(fn.get("arguments")),
+            )
+        )
     canonical = json.dumps(
         {"content": content_text, "tool_calls": calls},
         ensure_ascii=False,
@@ -95,6 +101,25 @@ def assistant_turn_signature(assistant_msg: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _canonical_tool_arguments(arguments: Any) -> str:
+    """Normalize valid JSON arguments while preserving malformed raw input."""
+    decoded = arguments
+    if isinstance(arguments, str):
+        try:
+            decoded = json.loads(arguments)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return arguments
+    if isinstance(decoded, Mapping):
+        return canonical_tool_args(decoded)
+    return json.dumps(
+        decoded,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 class AssistantRepetitionGuard:

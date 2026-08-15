@@ -38,6 +38,13 @@ def test_signature_distinguishes_different_arguments():
     assert assistant_turn_signature(a) != assistant_turn_signature(b)
 
 
+def test_signature_canonicalizes_semantically_identical_json_arguments():
+    a = _turn(args='{"action":"click","point":{"x":10,"y":20}}')
+    b = _turn(args=' { "point": { "y": 20, "x": 10 }, "action": "click" } ')
+
+    assert assistant_turn_signature(a) == assistant_turn_signature(b)
+
+
 def test_signature_flattens_list_content():
     a = _turn(content=[{"type": "text", "text": "hello"}])
     b = _turn(content="hello")

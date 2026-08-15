@@ -4305,6 +4305,74 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_repetition_nudge_uses_tool_result_steer_channel(self, agent):
+        """A mid-loop guard nudge must preserve assistant/tool role pairing."""
+        self._setup_agent(agent)
+        from agent.prompt_builder import STEER_MARKER_OPEN
+        from agent.repetition_guard import REPETITION_NUDGE_MESSAGE
+
+        args = [
+            '{"query":"status","filters":{"limit":10,"sort":"new"}}',
+            '{"filters":{"sort":"new","limit":10},"query":"status"}',
+            ' { "query": "status", "filters": { "limit": 10, "sort": "new" } } ',
+        ]
+        repeated = [
+            _mock_response(
+                content="Checking again.",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="web_search",
+                        arguments=arguments,
+                        call_id=f"c{index}",
+                    )
+                ],
+            )
+            for index, arguments in enumerate(args, start=1)
+        ]
+        agent.client.chat.completions.create.side_effect = [
+            *repeated,
+            _mock_response(content="Changed approach.", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="same result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("check the current status")
+
+        assert result["final_response"] == "Changed approach."
+        messages = result["messages"]
+        assert not any(
+            message.get("_repetition_guard_synthetic")
+            for message in messages
+            if isinstance(message, dict)
+        )
+        tool_results = [
+            message
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "tool"
+        ]
+        assert len(tool_results) == 3
+        assert STEER_MARKER_OPEN in tool_results[-1]["content"]
+        assert REPETITION_NUDGE_MESSAGE in tool_results[-1]["content"]
+        assert [
+            message.get("role")
+            for message in messages
+            if isinstance(message, dict) and message.get("role") != "system"
+        ][:8] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)
         agent.verbose_logging = True

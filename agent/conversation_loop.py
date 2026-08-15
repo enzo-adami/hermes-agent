@@ -5084,8 +5084,8 @@ def run_conversation(
                 # calls without progress (e.g. re-screenshotting a page
                 # that changes by a few pixels while narrating the same
                 # "verifying the scene" line indefinitely).  Detect the
-                # repeated assistant turn itself and inject a corrective
-                # user message after this round's tool results; with
+                # repeated assistant turn itself and attach a corrective
+                # out-of-band steer to this round's last tool result; with
                 # ``repetition_guard.abort_enabled`` set, continued
                 # repetition after the nudge ends the turn cleanly.
                 _rep_action = "ok"
@@ -5120,11 +5120,11 @@ def run_conversation(
                     break
                 if _rep_action == "nudge":
                     from agent.repetition_guard import REPETITION_NUDGE_MESSAGE
-                    messages.append({
-                        "role": "user",
-                        "content": REPETITION_NUDGE_MESSAGE,
-                        "_repetition_guard_synthetic": True,
-                    })
+                    agent.steer(REPETITION_NUDGE_MESSAGE)
+                    agent._apply_pending_steer_to_tool_results(
+                        messages,
+                        len(assistant_msg.get("tool_calls") or []),
+                    )
                     agent._session_messages = messages
                     logger.info(
                         "repetition guard nudge issued (identical assistant turn repeated)"
