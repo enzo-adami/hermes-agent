@@ -792,6 +792,132 @@ def _check_stale_giveup(agent) -> None:
         )
 
 
+# ── Stream progress vs. keep-alive (#83657) ────────────────────────────
+# The stale-stream detector was written to kill "connections kept alive by
+# SSE pings but no actual data" — but it timestamped EVERY stream event, so
+# any content-free frame refreshed its patience: an Anthropic ``ping``, an
+# OpenAI-compatible gateway's empty-delta heartbeat. A provider degraded into
+# drip mode therefore held every activity-based guard (stale detector, gateway
+# inactivity monitor, cron inactivity timeout) off indefinitely. Only events
+# that actually move the response forward count as progress now.
+_PROGRESS_DELTA_FIELDS = (
+    "content",
+    "reasoning_content",
+    "reasoning",
+    "tool_calls",
+    "function_call",
+    "role",
+    "refusal",
+    "audio",
+)
+
+
+def _value_is_present(value: object) -> bool:
+    """True when a delta field carries something (empty containers do not)."""
+    if value is None:
+        return False
+    if isinstance(value, (str, bytes, list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def _delta_has_payload(delta: object) -> bool:
+    for field in _PROGRESS_DELTA_FIELDS:
+        if _value_is_present(getattr(delta, field, None)):
+            return True
+    # Provider-specific fields (thinking blocks, vendor reasoning channels)
+    # land in the SDK's extra-field bag rather than a typed attribute.
+    extra = getattr(delta, "model_extra", None)
+    if isinstance(extra, dict) and any(_value_is_present(v) for v in extra.values()):
+        return True
+    return False
+
+
+def stream_chunk_is_progress(chunk: object) -> bool:
+    """Return True when a stream event carries real provider progress.
+
+    Only events *proven* to be content-free are withheld from the stale
+    detector's clock — every unknown or opaque shape counts as progress, so a
+    provider whose chunks we cannot introspect is never killed early.
+    """
+    if chunk is None:
+        return False
+
+    # Anthropic Messages stream: ``ping`` is the documented keep-alive event.
+    event_type = getattr(chunk, "type", None)
+    if isinstance(event_type, str):
+        return event_type != "ping"
+
+    choices = getattr(chunk, "choices", None)
+    if choices is None:
+        return True
+    if _value_is_present(getattr(chunk, "usage", None)):
+        return True
+    if not choices:
+        # No choices and no usage — a bare frame holding the socket open.
+        return False
+    for choice in choices:
+        if _value_is_present(getattr(choice, "finish_reason", None)):
+            return True
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            # Non-delta shapes (e.g. a full ``message``) are never heartbeats.
+            return True
+        if _delta_has_payload(delta):
+            return True
+    return False
+
+
+def resolve_stream_hard_timeout(
+    provider: str | None,
+    model: str | None,
+    stale_timeout: float | None,
+    base_url: str | None = None,
+) -> float:
+    """Wall-clock ceiling for ONE streaming call, in seconds (``inf`` = off).
+
+    Every other guard on this path is activity-based and therefore resettable
+    by the provider itself. This one is not: it starts when the request starts
+    and never moves, so a call that streams forever is eventually handed back
+    to the retry/fallback chain instead of stalling the turn (issue #83657 —
+    a single nous call ran 1239s and delayed a cron run past its window).
+
+    Resolution order: ``providers.<id>[.models.<model>].max_call_seconds`` →
+    ``HERMES_STREAM_MAX_CALL_SECONDS`` → ``HERMES_API_TIMEOUT`` (the
+    documented per-call API timeout, which streaming requests never enforced).
+    ``0`` at any level disables the ceiling.
+
+    Local endpoints are exempt unless the ceiling is set explicitly: they have
+    no overloaded origin in front of them, and a self-hosted model legitimately
+    generating for hours is the case the local branches elsewhere in this file
+    already protect. The *derived* ceiling is floored at the stale timeout so
+    it can never preempt the idle detector (which owns the richer reconnect
+    path); an explicitly configured ceiling is honored as written.
+    """
+    configured = None
+    try:
+        from hermes_cli.timeouts import get_provider_max_call_timeout
+
+        configured = get_provider_max_call_timeout(provider or "", model)
+    except Exception:
+        logger.debug("max_call_seconds lookup failed", exc_info=True)
+
+    if configured is not None:
+        hard = float(configured)
+    elif os.environ.get("HERMES_STREAM_MAX_CALL_SECONDS", "").strip():
+        hard = env_float("HERMES_STREAM_MAX_CALL_SECONDS", 1800.0)
+    elif base_url and is_local_endpoint(base_url):
+        return float("inf")
+    else:
+        hard = env_float("HERMES_API_TIMEOUT", 1800.0)
+        if stale_timeout is not None and math.isfinite(stale_timeout):
+            hard = max(hard, float(stale_timeout))
+
+    if hard <= 0 or not math.isfinite(hard):
+        return float("inf")
+    return hard
+
+
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     """Stale-stream patience for a provider that is never a local endpoint.
 
@@ -3910,8 +4036,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Record provider activity before Relay processes the chunk. This
             # prevents the stale watchdog from cancelling a live stream while
             # an interceptor or codec is still handling an already-received
-            # event.
-            last_chunk_time["t"] = time.time()
+            # event.  Keep-alive frames carry no progress and must not refresh
+            # the watchdog's patience (#83657).
+            if stream_chunk_is_progress(_chunk):
+                last_chunk_time["t"] = time.time()
             return True
 
         def _relay_final_response() -> dict[str, Any]:
@@ -3988,7 +4116,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             stream,
             response=lambda: attempt_stream_response["value"],
         ):
-            last_chunk_time["t"] = time.time()
+            # Keep-alive frames keep the SESSION alive (activity touch below)
+            # but must not reset the stale detector — that is what let a
+            # drip-feeding provider outlive every watchdog (#83657).
+            if stream_chunk_is_progress(chunk):
+                last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
 
             # Update per-attempt diagnostic counters.  Best-effort —
@@ -3997,7 +4129,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             try:
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
-                    _diag["first_chunk_at"] = last_chunk_time["t"]
+                    _diag["first_chunk_at"] = time.time()
                 # Approximate byte size from the chunk's delta payload —
                 # exact wire bytes aren't exposed by the SDK. A full
                 # repr() per chunk was 5.5-8.8 µs of pure CPU on the
@@ -4504,12 +4636,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         try:
             for event in stream:
                 saw_stream_event = True
-                last_chunk_time["t"] = time.time()
+                # Anthropic emits ``ping`` events purely to hold the socket
+                # open; they are not progress for the stale detector (#83657).
+                if stream_chunk_is_progress(event):
+                    last_chunk_time["t"] = time.time()
                 agent._touch_activity("receiving stream response")
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
-                        _diag["first_chunk_at"] = last_chunk_time["t"]
+                        _diag["first_chunk_at"] = time.time()
                     _diag["bytes"] = int(_diag.get("bytes", 0)) + _estimate_chunk_bytes(event)
                 except Exception:
                     pass
@@ -5023,6 +5158,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
+    # Wall-clock ceiling for the whole call (#83657).  Resolved before the
+    # worker starts so the clock covers connect + prefill + generation, and
+    # never reset by provider activity — it is the one bound a drip-feeding
+    # provider cannot push back.
+    _stream_hard_timeout = resolve_stream_hard_timeout(
+        getattr(agent, "provider", None),
+        getattr(agent, "model", None),
+        _stream_stale_timeout,
+        getattr(agent, "base_url", None),
+    )
+    _stream_started_at = time.time()
+
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
     t.start()
     _last_heartbeat = time.time()
@@ -5122,6 +5269,52 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             agent._touch_activity(
                 f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
+            )
+
+        # Hard wall-clock ceiling (#83657).  The stale detector above only
+        # measures silence, so a provider that keeps emitting can hold a
+        # single call open indefinitely (observed: 1239s on one request,
+        # which blew past the cron run's window).  Abort here and let the
+        # outer retry / fallback chain own recovery — reconnecting in place
+        # would hand the same wedged provider a brand-new budget.
+        _total_elapsed = time.time() - _stream_started_at
+        if _total_elapsed > _stream_hard_timeout:
+            logger.warning(
+                "Streaming call exceeded its wall-clock ceiling: %.0fs "
+                "(limit %.0fs). model=%s provider=%s. Aborting so retry / "
+                "fallback can take over.",
+                _total_elapsed, _stream_hard_timeout,
+                api_kwargs.get("model", "unknown"),
+                getattr(agent, "provider", "unknown"),
+            )
+            try:
+                agent._buffer_status(
+                    f"⚠️ Provider call ran {int(_total_elapsed)}s "
+                    f"(limit {int(_stream_hard_timeout)}s) — aborting and "
+                    f"retrying."
+                )
+            except Exception:
+                logger.debug("hard-timeout status buffering failed", exc_info=True)
+            # Mark cancelled BEFORE the force-close so the worker reads its
+            # own aborted transport as a cancellation and exits instead of
+            # burning mid-stream reconnect attempts (#6600 contract).
+            _request_cancelled["value"] = True
+            try:
+                _cancel_current_stream_attempt("stream_hard_timeout_kill")
+                _close_request_client_once("stream_hard_timeout_kill")
+            except Exception:
+                logger.debug("hard-timeout stream abort failed", exc_info=True)
+            agent._touch_activity(
+                f"streaming call aborted at wall-clock ceiling "
+                f"({int(_total_elapsed)}s)"
+            )
+            raise TimeoutError(
+                f"Streaming API call exceeded its wall-clock ceiling of "
+                f"{int(_stream_hard_timeout)}s "
+                f"(model: {api_kwargs.get('model', 'unknown')}). The provider "
+                f"kept the connection open without finishing the response. "
+                f"Tune HERMES_STREAM_MAX_CALL_SECONDS or "
+                f"providers.<id>.max_call_seconds (0 disables)."
             )
 
         if agent._interrupt_requested:
@@ -5270,6 +5463,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
 
 __all__ = [
+    "stream_chunk_is_progress",
+    "resolve_stream_hard_timeout",
     "interruptible_api_call",
     "build_api_kwargs",
     "build_assistant_message",
