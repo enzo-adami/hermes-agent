@@ -400,6 +400,7 @@ class TestSegmentedDispatchIntegration:
         messages = []
         executed = []
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
 
         def fake_handle(name, args, task_id, **kwargs):
             executed.append(kwargs["tool_call_id"])
@@ -411,6 +412,41 @@ class TestSegmentedDispatchIntegration:
         assert executed == ["k1"]
         assert [m["tool_call_id"] for m in messages] == ["k1", "s1", "s2"]
         assert all("successful Kanban lifecycle handoff" in m["content"] for m in messages[1:])
+
+    def test_stale_kanban_handoff_does_not_stop_successor(self, agent, monkeypatch):
+        from agent.tool_executor import execute_tool_calls_segmented
+
+        calls = [
+            _tc("web_search", '{"query":"successor"}', call_id="s1"),
+            _tc("terminal", '{"command":"true"}', call_id="t1"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+        agent._kanban_lifecycle_handoff = {
+            "tool": "kanban_request_changes",
+            "task_id": "t_1",
+            "run_id": 1,
+            "status": "ready",
+        }
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "2")
+
+        def fake_handle(name, args, task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            execute_tool_calls_segmented(
+                agent,
+                msg,
+                messages,
+                "task-1",
+                segments=[("parallel", calls[:1]), ("sequential", calls[1:])],
+            )
+
+        assert executed == ["s1", "t1"]
+        assert agent._kanban_lifecycle_handoff is None
 
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only

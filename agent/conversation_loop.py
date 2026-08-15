@@ -6801,7 +6801,9 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
-                if getattr(agent, "_kanban_lifecycle_handoff", None):
+                from agent.tool_executor import _kanban_handoff_matches_current_claim
+
+                if _kanban_handoff_matches_current_claim(agent):
                     _turn_exit_reason = "kanban_lifecycle_handoff"
                     # The lifecycle tool transferred custody and closed this
                     # run. Do not ask the model for another turn: a stale

@@ -161,9 +161,10 @@ def _worker_run_id(task_id: str) -> Optional[int]:
     if not raw:
         return None
     try:
-        return int(raw)
+        run_id = int(raw)
     except ValueError:
         return None
+    return run_id if run_id > 0 else None
 
 
 def _stamp_worker_session_metadata(
@@ -774,12 +775,13 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and keep this task alive."
                 )
 
+            expected_run_id = _worker_run_id(tid)
             try:
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=expected_run_id,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -813,7 +815,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            return _ok(
+                task_id=tid,
+                run_id=(
+                    expected_run_id
+                    if expected_run_id is not None
+                    else (run.id if run else None)
+                ),
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -876,12 +885,13 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        expected_run_id = _worker_run_id(tid)
         try:
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
                 metadata=metadata,
             )
             if not ok:
@@ -895,7 +905,11 @@ def _handle_block(args: dict, **kw) -> str:
             landed = kb.get_task(conn, tid)
             return _ok(
                 task_id=tid,
-                run_id=run.id if run else None,
+                run_id=(
+                    expected_run_id
+                    if expected_run_id is not None
+                    else (run.id if run else None)
+                ),
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
             )
@@ -959,12 +973,13 @@ def _handle_request_review(args: dict, **kw) -> str:
                     "Provide acceptance evidence matching the card before "
                     "requesting review."
                 )
+            expected_run_id = _worker_run_id(tid)
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
                 with_reason=True,
             )
             if not ok:
@@ -976,7 +991,11 @@ def _handle_request_review(args: dict, **kw) -> str:
             landed = kb.get_task(conn, tid)
             return _ok(
                 task_id=tid,
-                run_id=run.id if run else None,
+                run_id=(
+                    expected_run_id
+                    if expected_run_id is not None
+                    else (run.id if run else None)
+                ),
                 status=landed.status if landed else "review",
             )
         finally:
@@ -1012,11 +1031,12 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            expected_run_id = _worker_run_id(tid)
             ok, detail = kb.request_changes(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
                 metadata=metadata,
             )
             if not ok:
@@ -1027,7 +1047,11 @@ def _handle_request_changes(args: dict, **kw) -> str:
             run = kb.latest_run(conn, tid)
             return _ok(
                 task_id=tid,
-                run_id=run.id if run else None,
+                run_id=(
+                    expected_run_id
+                    if expected_run_id is not None
+                    else (run.id if run else None)
+                ),
                 status=landed.status if landed else "ready",
                 implementer=detail,
             )

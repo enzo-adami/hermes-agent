@@ -149,6 +149,7 @@ def test_successful_lifecycle_handoff_latches_worker_stop(monkeypatch):
 
     agent = SimpleNamespace()
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
     assert _record_successful_kanban_handoff(
         agent,
         "kanban_request_review",
@@ -159,6 +160,110 @@ def test_successful_lifecycle_handoff_latches_worker_stop(monkeypatch):
         "task_id": "t_1",
         "run_id": 7,
         "status": "review",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ok": True, "task_id": "t_successor", "run_id": 7},
+        {"ok": True, "task_id": "t_1", "run_id": 8},
+        {"ok": True, "task_id": "t_1"},
+    ],
+)
+def test_lifecycle_handoff_requires_exact_dispatcher_claim(monkeypatch, payload):
+    from agent.tool_executor import _record_successful_kanban_handoff
+
+    agent = SimpleNamespace()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+
+    assert not _record_successful_kanban_handoff(
+        agent,
+        "kanban_request_review",
+        json.dumps(payload),
+    )
+    assert not hasattr(agent, "_kanban_lifecycle_handoff")
+
+
+def test_lifecycle_handoff_requires_dispatcher_run_id(monkeypatch):
+    from agent.tool_executor import _record_successful_kanban_handoff
+
+    agent = SimpleNamespace()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+
+    assert not _record_successful_kanban_handoff(
+        agent,
+        "kanban_complete",
+        json.dumps({"ok": True, "task_id": "t_1", "run_id": 7}),
+    )
+    assert not hasattr(agent, "_kanban_lifecycle_handoff")
+
+
+def test_stale_handoff_latch_cannot_stop_successor_claim(monkeypatch):
+    from agent.tool_executor import _kanban_handoff_matches_current_claim
+
+    agent = SimpleNamespace(
+        _kanban_lifecycle_handoff={
+            "tool": "kanban_request_changes",
+            "task_id": "t_1",
+            "run_id": 7,
+            "status": "ready",
+        }
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "8")
+    assert not _kanban_handoff_matches_current_claim(agent)
+    assert agent._kanban_lifecycle_handoff is None
+
+
+def test_lifecycle_result_uses_closed_worker_run_not_later_latest_run(
+    monkeypatch,
+    worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    worker_run_id = int(__import__("os").environ["HERMES_KANBAN_RUN_ID"])
+    monkeypatch.setattr(
+        kb,
+        "latest_run",
+        lambda _conn, _task_id: SimpleNamespace(id=worker_run_id + 1),
+    )
+
+    out = json.loads(
+        kt._handle_block(
+            {"reason": "external input required", "kind": "needs_input"},
+            runtime_identity=_identity(),
+        )
+    )
+
+    assert out["ok"] is True
+    assert out["run_id"] == worker_run_id
+
+
+def test_runtime_identity_uses_effective_route_not_initial_config():
+    from agent.tool_executor import _runtime_identity
+
+    agent = SimpleNamespace(
+        provider="fallback-provider",
+        model="effective-model",
+        api_mode="responses",
+        session_id="effective-session",
+        _session_init_model_config={
+            "provider": "requested-provider",
+            "model": "requested-model",
+            "api_mode": "chat_completions",
+        },
+    )
+
+    assert _runtime_identity(agent) == {
+        "provider": "fallback-provider",
+        "model": "effective-model",
+        "api_mode": "responses",
+        "session_id": "effective-session",
+        "source": "agent_runtime_after_provider_response",
     }
 
 

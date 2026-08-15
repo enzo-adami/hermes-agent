@@ -71,13 +71,31 @@ def _runtime_identity(agent) -> dict[str, str]:
     }
 
 
-def _record_successful_kanban_handoff(agent, function_name: str, result: Any) -> bool:
-    """Latch a successful lifecycle transfer so this worker stops immediately."""
+def _kanban_worker_claim() -> tuple[str, int] | None:
+    """Return the exact dispatcher-owned task/run claim for this process."""
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
-    if not os.environ.get("HERMES_KANBAN_TASK") or not is_dispatcher_owned_worker_context():
-        return False
+    if not is_dispatcher_owned_worker_context():
+        return None
+    task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not task_id or isinstance(raw_run_id, bool):
+        return None
+    try:
+        run_id = int(raw_run_id)
+    except (TypeError, ValueError):
+        return None
+    if run_id <= 0:
+        return None
+    return task_id, run_id
+
+
+def _record_successful_kanban_handoff(agent, function_name: str, result: Any) -> bool:
+    """Latch a successful lifecycle transfer so this worker stops immediately."""
     if function_name not in _KANBAN_LIFECYCLE_HANDOFF_TOOLS:
+        return False
+    claim = _kanban_worker_claim()
+    if claim is None:
         return False
     try:
         payload = json.loads(result) if isinstance(result, str) else result
@@ -85,12 +103,37 @@ def _record_successful_kanban_handoff(agent, function_name: str, result: Any) ->
         return False
     if not isinstance(payload, dict) or payload.get("ok") is not True:
         return False
+    payload_run_id = payload.get("run_id")
+    if isinstance(payload_run_id, bool):
+        return False
+    try:
+        payload_run_id = int(payload_run_id)
+    except (TypeError, ValueError):
+        return False
+    task_id, run_id = claim
+    if str(payload.get("task_id") or "").strip() != task_id or payload_run_id != run_id:
+        return False
     agent._kanban_lifecycle_handoff = {
         "tool": function_name,
-        "task_id": payload.get("task_id"),
-        "run_id": payload.get("run_id"),
+        "task_id": task_id,
+        "run_id": run_id,
         "status": payload.get("status"),
     }
+    return True
+
+
+def _kanban_handoff_matches_current_claim(agent) -> bool:
+    """Consume a latch only while its originating task/run claim is current."""
+    handoff = getattr(agent, "_kanban_lifecycle_handoff", None)
+    claim = _kanban_worker_claim()
+    if not isinstance(handoff, dict) or claim is None:
+        if handoff is not None:
+            agent._kanban_lifecycle_handoff = None
+        return False
+    task_id, run_id = claim
+    if handoff.get("task_id") != task_id or handoff.get("run_id") != run_id:
+        agent._kanban_lifecycle_handoff = None
+        return False
     return True
 
 
@@ -2496,7 +2539,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         if getattr(agent, "_incremental_persistence_failed", False):
             return
 
-        if getattr(agent, "_kanban_lifecycle_handoff", None):
+        if _kanban_handoff_matches_current_claim(agent):
             remaining_calls = [
                 call
                 for _kind, later_calls in segments[segment_index + 1:]
