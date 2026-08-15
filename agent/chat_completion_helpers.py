@@ -34,6 +34,7 @@ from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
     collapse_degenerate_repetition,
+    collapse_degenerate_repetition_in_text_blocks,
 )
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -1020,7 +1021,20 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # agent/transports/anthropic.py and agent/anthropic_adapter.py.
     ordered_blocks = getattr(assistant_message, "anthropic_content_blocks", None)
     if ordered_blocks:
-        msg["anthropic_content_blocks"] = ordered_blocks
+        sanitized_blocks, _ordered_degen_runs = (
+            collapse_degenerate_repetition_in_text_blocks(ordered_blocks)
+        )
+        msg["anthropic_content_blocks"] = sanitized_blocks
+        if _ordered_degen_runs:
+            logger.warning(
+                "Collapsed %d degenerate token-repetition run(s) from ordered "
+                "Anthropic text block(s) before persist "
+                "(model=%s provider=%s finish_reason=%s)",
+                _ordered_degen_runs,
+                getattr(agent, "model", "unknown"),
+                getattr(agent, "provider", "unknown"),
+                finish_reason,
+            )
 
     # Codex Responses API: preserve encrypted reasoning items for
     # multi-turn continuity. These get replayed as input on the next turn.

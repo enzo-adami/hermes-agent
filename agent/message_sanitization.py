@@ -495,6 +495,12 @@ _DEGENERATE_TOKEN = r"[A-Za-z0-9_]{1,20}"
 # natural writing while catching the 50-100x runs degeneration produces.
 _DEGENERATE_RUN_MIN = 8
 
+# Markdown fenced code is deliberately outside the sanitizer's authority.
+# A model may legitimately emit repetitive examples, fixtures, logs, or test
+# vectors inside either backtick or tilde fences.  Treat an unterminated fence
+# as protected through EOF: a false negative is safer than corrupting code.
+_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
+
 
 def _degenerate_run_regex(min_repeats: int) -> "re.Pattern[str]":
     # (token)( ws (same token) ){min_repeats-1,}
@@ -504,6 +510,46 @@ def _degenerate_run_regex(min_repeats: int) -> "re.Pattern[str]":
         r"(?:\s+\1\b){" + str(backrefs) + r",}"
     )
     return re.compile(pattern)
+
+
+def _partition_fenced_text(text: str) -> list[tuple[bool, str]]:
+    """Return ``(is_fenced, text)`` spans without changing a byte."""
+    spans: list[tuple[bool, str]] = []
+    current: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+
+    for line in text.splitlines(keepends=True):
+        if not in_fence:
+            opener = _FENCE_OPEN_RE.match(line)
+            if opener is None:
+                current.append(line)
+                continue
+            if current:
+                spans.append((False, "".join(current)))
+            current = [line]
+            fence = opener.group("fence")
+            fence_char = fence[0]
+            fence_len = len(fence)
+            in_fence = True
+            continue
+
+        current.append(line)
+        candidate = line.rstrip("\r\n")
+        if re.fullmatch(
+            rf"[ \t]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*",
+            candidate,
+        ):
+            spans.append((True, "".join(current)))
+            current = []
+            in_fence = False
+            fence_char = ""
+            fence_len = 0
+
+    if current:
+        spans.append((in_fence, "".join(current)))
+    return spans
 
 
 def text_has_degenerate_repetition(text: str, min_repeats: int = _DEGENERATE_RUN_MIN) -> bool:
@@ -518,7 +564,13 @@ def text_has_degenerate_repetition(text: str, min_repeats: int = _DEGENERATE_RUN
     """
     if not isinstance(text, str) or not text:
         return False
-    return _degenerate_run_regex(max(2, min_repeats)).search(text) is not None
+    regex = _degenerate_run_regex(max(2, min_repeats))
+    if "```" not in text and "~~~" not in text:
+        return regex.search(text) is not None
+    return any(
+        not is_fenced and regex.search(span) is not None
+        for is_fenced, span in _partition_fenced_text(text)
+    )
 
 
 def collapse_degenerate_repetition(
@@ -542,13 +594,57 @@ def collapse_degenerate_repetition(
         collapsed += 1
         return match.group(1)
 
-    cleaned = regex.sub(_repl, text)
-    if collapsed:
+    if "```" not in text and "~~~" not in text:
+        cleaned = regex.sub(_repl, text)
+        has_fenced_span = False
+    else:
+        spans = _partition_fenced_text(text)
+        has_fenced_span = any(is_fenced for is_fenced, _span in spans)
+        cleaned = "".join(
+            span if is_fenced else regex.sub(_repl, span)
+            for is_fenced, span in spans
+        )
+    if collapsed and not has_fenced_span:
         # A run that filled the whole turn can leave doubled blank lines or
         # trailing whitespace behind; tidy without disturbing real prose.
         cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, collapsed
+
+
+def collapse_degenerate_repetition_in_text_blocks(
+    blocks: Any,
+    min_repeats: int = _DEGENERATE_RUN_MIN,
+) -> tuple[Any, int]:
+    """Collapse repetition only in ordered ``type=text`` content blocks.
+
+    The provider-owned input is never mutated.  Non-text blocks — including
+    thinking, reasoning, tool_use, and tool_result — retain their original
+    objects and ordering.  A changed text block is shallow-copied so opaque
+    provider metadata remains intact while only its ``text`` field changes.
+    """
+    if not isinstance(blocks, list) or not blocks:
+        return blocks, 0
+
+    cleaned_blocks: list[Any] | None = None
+    total_runs = 0
+    for index, block in enumerate(blocks):
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        cleaned_text, runs = collapse_degenerate_repetition(text, min_repeats)
+        if not runs:
+            continue
+        if cleaned_blocks is None:
+            cleaned_blocks = list(blocks)
+        cleaned_block = dict(block)
+        cleaned_block["text"] = cleaned_text
+        cleaned_blocks[index] = cleaned_block
+        total_runs += runs
+
+    return (cleaned_blocks if cleaned_blocks is not None else blocks), total_runs
 
 
 __all__ = [
@@ -566,4 +662,5 @@ __all__ = [
     "_sanitize_structure_non_ascii",
     "text_has_degenerate_repetition",
     "collapse_degenerate_repetition",
+    "collapse_degenerate_repetition_in_text_blocks",
 ]
