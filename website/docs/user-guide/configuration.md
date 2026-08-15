@@ -936,19 +936,19 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
-## Offline Mode (air-gapped deployments)
+## Background Network Suppression
 
-On intranet / air-gapped networks, Hermes must never open an unsolicited outbound socket. Setting `agent.offline: true` suppresses the two network calls a cold Hermes process would otherwise make on its own:
+Setting `agent.offline: true` suppresses two background network calls a cold Hermes process would otherwise make on its own:
 
 - the cold-cache `models.dev` registry fetch (model/provider metadata), which then lives entirely off its in-memory / disk caches
 - the banner update check (`git ls-remote` against upstream)
 
 ```yaml
 agent:
-  offline: true   # Never touch the network unless the user asked for it (default: false)
+  offline: true   # Suppress background metadata and update checks (default: false)
 ```
 
-Explicit refreshes of these two sources are suppressed as well — `fetch_models_dev(force_refresh=True)` and the `/version` update check both no-op, since in an air-gapped environment they can only fail. Other user-invoked network activity is unaffected: provider API calls, web search/extract tools, and the skills hub all still work. The setting is read live from `config.yaml`, so a long-lived gateway picks up an edit without a restart.
+Explicit refreshes of these two sources are suppressed as well — `fetch_models_dev(force_refresh=True)` and the `/version` update check both no-op. This setting is **not a network sandbox or an air-gap guarantee**: provider API calls, web search/extract tools, the skills hub, plugins, and user commands can still use the network. Enforce non-egress separately at the container, firewall, or operating-system layer. The setting is read live from `config.yaml`, so a long-lived gateway picks up an edit without a restart.
 
 ## Verify-on-Stop (coding verification)
 

@@ -320,7 +320,9 @@ class TestFetchModelsDev:
 
         home = get_hermes_home()
         home.mkdir(parents=True, exist_ok=True)
-        (home / "config.yaml").write_text("agent:\n  offline: true\n")
+        (home / "config.yaml").write_text(
+            "agent:\n  offline: true\n", encoding="utf-8"
+        )
 
         md._models_dev_cache = {}
         with patch.object(md, "_load_disk_cache", return_value=SAMPLE_REGISTRY):
@@ -413,4 +415,3 @@ class TestGetModelCapabilities:
             caps = get_model_capabilities("gemini", "weird-model")
         assert caps is not None
         assert caps.supports_vision is False
-

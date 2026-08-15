@@ -8,7 +8,7 @@ from hermes_cli.config import offline_mode_enabled
 def _write_config(text: str) -> None:
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(text)
+    (home / "config.yaml").write_text(text, encoding="utf-8")
 
 
 def test_offline_mode_disabled_by_default():

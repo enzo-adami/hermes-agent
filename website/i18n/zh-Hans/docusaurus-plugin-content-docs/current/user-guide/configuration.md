@@ -720,19 +720,19 @@ agent:
 
 `agent.api_max_retries` 控制 Hermes 在回退 provider 切换启动**之前**对瞬时错误（速率限制、连接断开、5xx）重试 provider API 调用的次数。默认为 `3` —— 总共四次尝试。如果您配置了[回退 providers](/user-guide/features/fallback-providers) 并希望更快地故障转移，请将其降至 `0`，这样主 provider 上的第一个瞬时错误会立即切换到回退，而不是对不稳定的端点进行重试。
 
-## 离线模式（内网 / 气隙部署）
+## 后台网络请求抑制
 
-在内网 / 气隙环境中，Hermes 不得主动打开任何出站连接。设置 `agent.offline: true` 会抑制冷启动进程原本会自行发出的两条网络请求：
+设置 `agent.offline: true` 会抑制冷启动进程原本会自行发出的两条后台网络请求：
 
 - 冷缓存时的 `models.dev` 注册表拉取（模型/provider 元数据），此后完全依赖内存 / 磁盘缓存
 - 启动 banner 的更新检查（对上游仓库执行 `git ls-remote`）
 
 ```yaml
 agent:
-  offline: true   # 除非用户主动发起，否则不触碰网络（默认：false）
+  offline: true   # 抑制后台元数据和更新检查（默认：false）
 ```
 
-这两个数据源的显式刷新同样会被抑制 —— `fetch_models_dev(force_refresh=True)` 和 `/version` 更新检查都会直接跳过，因为在气隙环境中它们必然失败。其他用户主动发起的网络活动不受影响：provider API 调用、web 搜索/抓取工具、skills hub 都照常工作。该设置从 `config.yaml` 实时读取，长驻 gateway 修改后无需重启即可生效。
+这两个数据源的显式刷新同样会被抑制 —— `fetch_models_dev(force_refresh=True)` 和 `/version` 更新检查都会直接跳过。此设置**不是网络沙箱，也不保证气隙隔离**：provider API 调用、web 搜索/抓取工具、skills hub、插件和用户命令仍可使用网络。严格的非出站要求必须另外在容器、防火墙或操作系统层强制执行。该设置从 `config.yaml` 实时读取，长驻 gateway 修改后无需重启即可生效。
 
 ### API 超时
 
