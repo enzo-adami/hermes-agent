@@ -151,6 +151,22 @@ def test_new_worktree_branch_prefers_non_main_default_when_main_exists(tmp_path)
     assert remote_head != main_head
 
 
+def test_new_worktree_branch_refreshes_changed_default_when_old_branch_exists(tmp_path):
+    repo, seed = _make_remote_backed_repo(tmp_path, default_branch="main")
+    remote = Path(_git_output(repo, "remote", "get-url", "origin"))
+    main_head = _git_output(repo, "rev-parse", "refs/remotes/origin/main")
+    _git(seed, "switch", "-c", "trunk")
+    remote_head = _commit_file(seed, "remote.txt", "remote\n", "create trunk")
+    _git(seed, "push", "-u", "origin", "trunk")
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+    target = repo / ".worktrees" / "new-task"
+
+    kb._ensure_git_worktree(repo, target, "project/new-task")
+
+    assert _git_output(target, "rev-parse", "HEAD") == remote_head
+    assert remote_head != main_head
+
+
 def test_new_worktree_branch_refreshes_dangling_origin_head(tmp_path):
     repo, seed = _make_remote_backed_repo(tmp_path, default_branch="master")
     remote = Path(_git_output(repo, "remote", "get-url", "origin"))
@@ -249,7 +265,6 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
-
 
 
 

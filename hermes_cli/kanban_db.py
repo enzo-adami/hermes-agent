@@ -7551,42 +7551,44 @@ def _worktree_base_ref(repo_root: Path) -> str:
 
     candidates = []
     try:
-        symbolic = subprocess.run(
+        remote_head = subprocess.run(
             [
-                "git", "-C", str(repo_root), "symbolic-ref", "--quiet",
-                "refs/remotes/origin/HEAD",
+                "git", "-C", str(repo_root), "ls-remote", "--symref",
+                "origin", "HEAD",
             ],
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=30,
             check=False,
+            stdin=subprocess.DEVNULL,
+            env=env,
         )
-        symbolic_target = symbolic.stdout.strip()
-        if (
-            symbolic.returncode == 0
-            and symbolic_target.startswith("refs/remotes/origin/")
-            and _is_commit(symbolic_target)
-        ):
-            candidates.append(symbolic_target)
-        else:
-            remote_head = subprocess.run(
+        if remote_head.returncode == 0:
+            for line in remote_head.stdout.splitlines():
+                if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                    branch = line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
+                    remote_default = f"refs/remotes/origin/{branch}"
+                    if _is_commit(remote_default):
+                        candidates.append(remote_default)
+                    break
+        if not candidates:
+            symbolic = subprocess.run(
                 [
-                    "git", "-C", str(repo_root), "ls-remote", "--symref",
-                    "origin", "HEAD",
+                    "git", "-C", str(repo_root), "symbolic-ref", "--quiet",
+                    "refs/remotes/origin/HEAD",
                 ],
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 timeout=30,
                 check=False,
-                stdin=subprocess.DEVNULL,
-                env=env,
             )
-            if remote_head.returncode == 0:
-                for line in remote_head.stdout.splitlines():
-                    if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
-                        branch = line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
-                        candidates.append(f"refs/remotes/origin/{branch}")
-                        break
+            symbolic_target = symbolic.stdout.strip()
+            if (
+                symbolic.returncode == 0
+                and symbolic_target.startswith("refs/remotes/origin/")
+                and _is_commit(symbolic_target)
+            ):
+                candidates.append(symbolic_target)
     except Exception as exc:
         _log.debug("kanban remote default resolution failed: %s", exc)
 
