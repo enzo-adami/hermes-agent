@@ -133,6 +133,10 @@ _BILLING_PATTERNS = [
     "account is deactivated",
     "plan does not include",
     "out of extra usage",  # Anthropic OAuth Pro/Max overage bucket depleted (HTTP 400)
+    # Anthropic OAuth used by a third-party app with an empty overage bucket
+    # (2026-08 policy wording, HTTP 400 invalid_request_error): plan limits no
+    # longer apply, so the request can never succeed until credits are added.
+    "draw from your extra usage",
     "out of funds",
     "run out of funds",
     "balance_depleted",

@@ -213,6 +213,24 @@ class TestClassifyApiError:
         assert result.retryable is False
 
 
+    def test_400_anthropic_third_party_extra_usage_is_billing(self):
+        """Anthropic's 2026-08 policy wording for subscription OAuth used by a
+        third-party app with an empty overage bucket arrives as HTTP 400
+        invalid_request_error.  Unclassified it armed no cooldown, so the
+        primary was re-hit (and re-400ed) on every single call (observed:
+        telegram gateway 2026-08-16, claude-opus-5)."""
+        e = MockAPIError(
+            "Error code: 400 - {'type': 'error', 'error': {'type': "
+            "'invalid_request_error', 'message': 'Third-party apps now draw "
+            "from your extra usage, not your plan limits. Add more at "
+            "claude.ai/settings/usage and keep going.'}}",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="anthropic", model="claude-opus-5")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+
+
 
 
     def test_404_free_tier_model_block_is_billing(self):
