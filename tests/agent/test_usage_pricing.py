@@ -89,8 +89,9 @@ def test_deepseek_v4_pro_pricing_entry_exists():
 
     Before this fix, deepseek-v4-pro sessions showed as unknown cost
     in hermes insights because the _OFFICIAL_DOCS_PRICING table had no
-    entry for that model.  See #24218.  Rates track the 2026-07 price cut
-    ($1.74/$3.48 → $0.435/$0.87).
+    entry for that model.  See #24218.  Rates track the 2026-08-16
+    peak/off-peak change (base = off-peak; peak billed via
+    peak_multiplier, see the peak-window tests below).
     """
     entry = get_pricing_entry(
         "deepseek-v4-pro",
@@ -100,9 +101,14 @@ def test_deepseek_v4_pro_pricing_entry_exists():
     assert entry is not None
     assert entry.input_cost_per_million is not None
     assert entry.output_cost_per_million is not None
-    assert float(entry.input_cost_per_million) == 0.435
-    assert float(entry.output_cost_per_million) == 0.87
-    assert float(entry.cache_read_cost_per_million) == 0.003625
+    assert float(entry.input_cost_per_million) == 0.66
+    assert float(entry.output_cost_per_million) == 1.98
+    assert float(entry.cache_read_cost_per_million) == 0.022
+    # Cache writes are free on DeepSeek — the explicit 0 keeps a reported
+    # cache_write_tokens count from collapsing the estimate to "unknown".
+    assert float(entry.cache_write_cost_per_million) == 0.0
+    assert float(entry.peak_multiplier) == 2.0
+    assert entry.peak_windows_utc == ((1, 4), (6, 10))
 
 
 
@@ -124,6 +130,70 @@ def test_deepseek_deprecated_aliases_price_as_v4_flash():
         ), alias
 
 
+
+
+def test_deepseek_peak_hours_double_the_estimate():
+    """DeepSeek bills peak hours (01-04 and 06-10 UTC) at 2× the off-peak
+    base rates since 2026-08-16.  The estimator prices by request time —
+    otherwise every peak-hour call under-reports by half (the 02:00 AST
+    night-cycle sits entirely inside the 06-10 UTC window)."""
+    from datetime import datetime, timezone
+
+    usage = CanonicalUsage(
+        input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=0,
+    )
+    off_peak = estimate_usage_cost(
+        "deepseek-v4-pro", usage, provider="deepseek",
+        at=datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc),
+    )
+    peak = estimate_usage_cost(
+        "deepseek-v4-pro", usage, provider="deepseek",
+        at=datetime(2026, 8, 17, 7, 0, tzinfo=timezone.utc),
+    )
+    assert float(off_peak.amount_usd) == 0.66 + 1.98
+    assert float(peak.amount_usd) == 2 * (0.66 + 1.98)
+    assert any("peak" in n for n in peak.notes)
+    assert not any("peak" in n for n in off_peak.notes)
+
+
+def test_deepseek_peak_window_boundaries_utc():
+    """[start, end) semantics: 06:00 is peak, 10:00 is not; the request's
+    own timezone must not matter (07:00 UTC expressed as 03:00 AST-0400
+    is still peak)."""
+    from datetime import datetime, timezone, timedelta
+
+    usage = CanonicalUsage(input_tokens=1_000_000)
+
+    def cost_at(dt):
+        return float(
+            estimate_usage_cost(
+                "deepseek-v4-pro", usage, provider="deepseek", at=dt
+            ).amount_usd
+        )
+
+    base = 0.66
+    assert cost_at(datetime(2026, 8, 17, 6, 0, tzinfo=timezone.utc)) == 2 * base
+    assert cost_at(datetime(2026, 8, 17, 10, 0, tzinfo=timezone.utc)) == base
+    assert cost_at(datetime(2026, 8, 17, 0, 59, tzinfo=timezone.utc)) == base
+    ast = timezone(timedelta(hours=-4))
+    assert cost_at(datetime(2026, 8, 17, 3, 0, tzinfo=ast)) == 2 * base
+
+
+def test_flat_pricing_entries_ignore_clock():
+    """Entries without peak fields (every non-DeepSeek provider) must price
+    identically at any hour — the multiplier is strictly opt-in."""
+    from datetime import datetime, timezone
+
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+    at_peak_hour = estimate_usage_cost(
+        "claude-3-haiku-20240307", usage, provider="anthropic",
+        at=datetime(2026, 8, 17, 7, 0, tzinfo=timezone.utc),
+    )
+    at_noon = estimate_usage_cost(
+        "claude-3-haiku-20240307", usage, provider="anthropic",
+        at=datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc),
+    )
+    assert at_peak_hour.amount_usd == at_noon.amount_usd
 
 
 def test_bedrock_claude_rows_all_carry_cache_pricing():

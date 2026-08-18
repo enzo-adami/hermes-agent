@@ -127,6 +127,13 @@ class PricingEntry:
     source_url: Optional[str] = None
     pricing_version: Optional[str] = None
     fetched_at: Optional[datetime] = None
+    # Time-of-day billing (DeepSeek introduced peak/off-peak on 2026-08-16):
+    # the per-million rates above are the BASE (off-peak) rates; requests whose
+    # UTC hour falls inside any [start, end) window in ``peak_windows_utc``
+    # are billed at ``peak_multiplier`` × base.  Both fields must be set
+    # together; entries without them keep flat pricing.
+    peak_multiplier: Optional[Decimal] = None
+    peak_windows_utc: Optional[tuple[tuple[int, int], ...]] = None
 
 
 @dataclass(frozen=True)
@@ -506,52 +513,71 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="anthropic-pricing-2026-05",
     ),
     # DeepSeek
-    # Snapshot of https://api-docs.deepseek.com/quick_start/pricing (2026-07).
-    # deepseek-chat / deepseek-reasoner are deprecated 2026-07-24 and now alias
+    # Snapshot of https://api-docs.deepseek.com/quick_start/pricing, updated
+    # 2026-08-16 16:00 UTC: peak/off-peak billing reintroduced with a general
+    # price INCREASE.  Base rates below are OFF-PEAK; peak hours
+    # (01:00-04:00 and 06:00-10:00 UTC) bill at 2× — carried by
+    # peak_multiplier/peak_windows_utc so estimates follow the clock.
+    # Cache WRITES are free on DeepSeek (only hit/miss/output are billed):
+    # the explicit 0 keeps a future cache_write_tokens report from
+    # collapsing the whole estimate to "unknown".
+    # deepseek-chat / deepseek-reasoner are deprecated 2026-07-24 and alias
     # deepseek-v4-flash's non-thinking / thinking modes — same rates.
     (
         "deepseek",
         "deepseek-chat",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.14"),
-        output_cost_per_million=Decimal("0.28"),
-        cache_read_cost_per_million=Decimal("0.0028"),
+        input_cost_per_million=Decimal("0.22"),
+        output_cost_per_million=Decimal("0.66"),
+        cache_read_cost_per_million=Decimal("0.007"),
+        cache_write_cost_per_million=Decimal("0"),
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-07",
+        pricing_version="deepseek-pricing-2026-08-16",
+        peak_multiplier=Decimal("2"),
+        peak_windows_utc=((1, 4), (6, 10)),
     ),
     (
         "deepseek",
         "deepseek-reasoner",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.14"),
-        output_cost_per_million=Decimal("0.28"),
-        cache_read_cost_per_million=Decimal("0.0028"),
+        input_cost_per_million=Decimal("0.22"),
+        output_cost_per_million=Decimal("0.66"),
+        cache_read_cost_per_million=Decimal("0.007"),
+        cache_write_cost_per_million=Decimal("0"),
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-07",
+        pricing_version="deepseek-pricing-2026-08-16",
+        peak_multiplier=Decimal("2"),
+        peak_windows_utc=((1, 4), (6, 10)),
     ),
     (
         "deepseek",
         "deepseek-v4-pro",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.435"),
-        output_cost_per_million=Decimal("0.87"),
-        cache_read_cost_per_million=Decimal("0.003625"),
+        input_cost_per_million=Decimal("0.66"),
+        output_cost_per_million=Decimal("1.98"),
+        cache_read_cost_per_million=Decimal("0.022"),
+        cache_write_cost_per_million=Decimal("0"),
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-07",
+        pricing_version="deepseek-pricing-2026-08-16",
+        peak_multiplier=Decimal("2"),
+        peak_windows_utc=((1, 4), (6, 10)),
     ),
     (
         "deepseek",
         "deepseek-v4-flash",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.14"),
-        output_cost_per_million=Decimal("0.28"),
-        cache_read_cost_per_million=Decimal("0.0028"),
+        input_cost_per_million=Decimal("0.22"),
+        output_cost_per_million=Decimal("0.66"),
+        cache_read_cost_per_million=Decimal("0.007"),
+        cache_write_cost_per_million=Decimal("0"),
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-07",
+        pricing_version="deepseek-pricing-2026-08-16",
+        peak_multiplier=Decimal("2"),
+        peak_windows_utc=((1, 4), (6, 10)),
     ),
     # Google Gemini
     (
@@ -1423,6 +1449,14 @@ def normalize_usage(
     )
 
 
+def _in_peak_window(entry: PricingEntry, at: datetime) -> bool:
+    """Whether *at* falls inside one of the entry's UTC peak windows."""
+    if not entry.peak_multiplier or not entry.peak_windows_utc:
+        return False
+    hour = at.astimezone(timezone.utc).hour
+    return any(start <= hour < end for start, end in entry.peak_windows_utc)
+
+
 def estimate_usage_cost(
     model_name: str,
     usage: CanonicalUsage,
@@ -1430,6 +1464,7 @@ def estimate_usage_cost(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    at: Optional[datetime] = None,
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
@@ -1482,6 +1517,15 @@ def estimate_usage_cost(
         amount += Decimal(usage.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_MILLION
     if entry.request_cost is not None and usage.request_count:
         amount += Decimal(usage.request_count) * entry.request_cost
+
+    # Time-of-day billing: applied to the whole amount because every
+    # component (input/cache/output) shares the same multiplier on providers
+    # that bill this way (DeepSeek peak = 2× off-peak across the board).
+    # ``at`` is the request time; per-call callers omit it and get "now",
+    # keeping historical estimates possible by passing the stored timestamp.
+    if _in_peak_window(entry, at or datetime.now(timezone.utc)):
+        amount *= entry.peak_multiplier
+        notes.append(f"peak-hours ×{entry.peak_multiplier} applied")
 
     status: CostStatus = "estimated"
     label = format_cost_label(amount)
