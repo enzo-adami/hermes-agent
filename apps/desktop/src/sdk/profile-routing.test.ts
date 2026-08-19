@@ -28,6 +28,9 @@ vi.mock('@/store/session', async () => {
     $gatewayState: atom('open'),
     $messages: atom([]),
     $selectedStoredSessionId: atom(null),
+    $sessions: atom([]),
+    rememberedSessionProfile: (_sessions: unknown, _sessionId: null | string, activeProfile: null | string) =>
+      (activeProfile ?? '').trim() || 'default',
     requestSessionResume: vi.fn(),
     setResumeExhaustedSessionId: vi.fn()
   }
@@ -101,23 +104,13 @@ const { openSession: openSessionCore } = await import('@/app/open-session')
 const { deleteProfile } = await import('@/hermes')
 const { requestGatewayForAgent, requestGatewayForProfile, retireLocalProfileGateways } = await import('@/store/gateway')
 
-const {
-  $activeGatewayProfile,
-  $gatewaySwapTarget,
-  $profiles,
-  ensureGatewayProfile,
-  refreshProfiles
-} = await import('@/store/profile')
+const { $activeGatewayProfile, $gatewaySwapTarget, $profiles, ensureGatewayProfile, refreshProfiles } =
+  await import('@/store/profile')
 
 const { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } = await import('@/store/session-states')
 
-const {
-  $activeSessionId,
-  $messages,
-  $selectedStoredSessionId,
-  requestSessionResume,
-  setResumeExhaustedSessionId
-} = await import('@/store/session')
+const { $activeSessionId, $messages, $selectedStoredSessionId, requestSessionResume, setResumeExhaustedSessionId } =
+  await import('@/store/session')
 
 const setMockAtom = <T>(store: unknown, value: T) => (store as { set(next: T): void }).set(value)
 
@@ -401,6 +394,45 @@ describe('profile-aware plugin session opens', () => {
     expect($gatewaySwapTarget.get()).toBeNull()
   })
 
+  it('resolves a history-bearing wake on transcript paint without waiting for the runtime (paint-first)', async () => {
+    vi.mocked(ensureGatewayProfile).mockImplementationOnce(async (target: null | string | undefined) => {
+      $activeGatewayProfile.set(target || 'default')
+    })
+
+    setMockAtom($selectedStoredSessionId, null)
+    setMockAtom($activeSessionId, null)
+    setMockAtom($messages, [])
+
+    let resolved = false
+
+    const opening = host
+      .openSession('slow-runtime-chat', {
+        profile: 'hyoseob',
+        awaitHydration: true,
+        expectHistory: true,
+        hydrationTimeoutMs: 1_000
+      })
+      .then(() => {
+        resolved = true
+      })
+
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(resolved).toBe(false)
+
+    // The REST prefetch paints the persisted transcript while the runtime
+    // resume (agent build, MCP discovery, skill load) is still warming — the
+    // exact cold-boot shape where the runtime takes 30s+ on slow machines.
+    // The wake must complete on the paint; the runtime binds in background.
+    setMockAtom($selectedStoredSessionId, 'slow-runtime-chat')
+    setMockAtom($messages, [{ id: 'painted-history', parts: [], role: 'assistant' }] as never)
+
+    await opening
+    expect(resolved).toBe(true)
+    expect($activeSessionId.get()).toBeNull()
+    expect($gatewaySwapTarget.get()).toBeNull()
+  })
+
   it('accepts an explicitly empty Bot Chat once its main runtime is bound', async () => {
     $activeGatewayProfile.set('hyoseob')
 
@@ -448,7 +480,10 @@ describe('profile-aware plugin session opens', () => {
         expectHistory: true,
         hydrationTimeoutMs: 1_000
       })
-      .then(() => 'resolved', error => String(error))
+      .then(
+        () => 'resolved',
+        error => String(error)
+      )
 
     await Promise.resolve()
 
