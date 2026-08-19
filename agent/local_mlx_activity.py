@@ -146,15 +146,20 @@ def current_active_request(*, stale_after_s: float | None = None) -> dict[str, A
 
 
 def _pid_alive(pid: Any) -> bool:
+    # psutil.pid_exists instead of os.kill(pid, 0): the signal-0 probe is NOT
+    # a no-op on Windows (it sends CTRL_C_EVENT to the target's console
+    # process group — bpo-14484), and psutil is already a core dependency.
     try:
         parsed = int(pid)
-        if parsed <= 0:
-            return False
-        os.kill(parsed, 0)
-        return True
-    except PermissionError:
-        return True
-    except (OSError, TypeError, ValueError):
+    except (TypeError, ValueError):
+        return False
+    if parsed <= 0:
+        return False
+    try:
+        import psutil
+
+        return bool(psutil.pid_exists(parsed))
+    except Exception:
         return False
 
 
