@@ -348,9 +348,9 @@ _TOOL_STUBS = {
     ),
     "write_file": (
         "write_file",
-        "path: str, content: str, cross_profile: bool = False",
-        '"""Write content to a file (always overwrites). Returns dict with status. cross_profile=True opts out of the cross-Hermes-profile soft guard."""',
-        '{"path": path, "content": content, "cross_profile": cross_profile}',
+        "path: str, content: str, cross_profile: bool = False, allow_shrink: bool = False",
+        '"""Write content to a file (always overwrites). Returns dict with status. cross_profile=True opts out of the cross-Hermes-profile soft guard. allow_shrink=True opts out of the safe-write guard that refuses replacing a file with a small fraction of its size."""',
+        '{"path": path, "content": content, "cross_profile": cross_profile, "allow_shrink": allow_shrink}',
     ),
     "search_files": (
         "search_files",

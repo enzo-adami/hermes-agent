@@ -536,6 +536,24 @@ class FileOperations(ABC):
         """Read complete binary content as base64 across the backend boundary."""
         return ReadResult(error="Binary reads are not implemented for this backend")
 
+    def file_size(self, path: str) -> Optional[int]:
+        """Byte size of an existing regular file, measured THROUGH this backend.
+
+        Exists so pre-write decisions (see the safe-write guard in
+        ``tools/file_tools.py``) can ask the backend that will actually
+        perform the write, instead of stat-ing the host filesystem. A host
+        ``os.path.getsize`` answers about the wrong file whenever the path is
+        relative to a task cwd, or the backend is a container or a remote
+        shell — that mismatch is why the 2026-06 version of the guard was
+        rejected on 2026-08-05.
+
+        Returns ``None`` for absent paths, non-regular files (FIFO, socket,
+        device, directory), and any backend that cannot answer. ``None`` means
+        UNKNOWN, never zero: callers must fail open and let the write proceed
+        rather than block on a size they could not measure.
+        """
+        return None
+
     @abstractmethod
     def write_file(self, path: str, content: str,
                    pre_content: Optional[str] = None) -> WriteResult:
@@ -1340,6 +1358,29 @@ class ShellFileOperations(FileOperations):
             f"elif [ -e {arg} ]; then echo {NOT_REGULAR_SENTINEL}; "
             f"else exit 1; fi"
         )
+
+    def file_size(self, path: str) -> Optional[int]:
+        """Byte size of ``path`` through this backend's shell. See the base.
+
+        Uses the same probe as :meth:`read_file`, so it inherits its safety:
+        ``[ -f ]`` is a stat, not an open, and a FIFO or device reports the
+        not-regular sentinel instead of blocking the turn forever.
+        """
+        try:
+            expanded = self._expand_path(path)
+            probe = self._exec(self._size_probe_cmd(expanded))
+        except Exception:
+            return None
+        if getattr(probe, "exit_code", 1) != 0:
+            return None
+        raw = _strip_terminal_fence_leaks(getattr(probe, "stdout", "") or "").strip()
+        if not raw or raw == NOT_REGULAR_SENTINEL:
+            return None
+        try:
+            size = int(raw)
+        except ValueError:
+            return None
+        return size if size >= 0 else None
 
     @staticmethod
     def _not_regular_error(path: str) -> ReadResult:

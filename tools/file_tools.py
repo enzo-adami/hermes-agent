@@ -2219,9 +2219,100 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     return None
 
 
+def _safe_write_config() -> tuple[bool, int, float]:
+    """Read the safe-write (anti-blanking) guard config.
+
+    Returns ``(enabled, min_bytes, shrink_ratio)``. Config read failures keep
+    the guard ON — it prevents data loss, so the safe direction is armed.
+
+    Config keys (config.yaml)::
+
+        tool_loop_guardrails:
+          safe_write_enabled: true      # default
+          safe_write_min_bytes: 200     # below this, an existing file is not worth guarding
+          safe_write_shrink_ratio: 0.5  # new < ratio * existing = suspicious
+
+    The 0.5 ratio is empirical, not a round number: the real overwrites in the
+    2026-06-09 incident kept about 22 % of the file, so 0.2 would have missed
+    them. Kept as-is from the pre-2026-08 version — the thresholds were never
+    what was contested, the implementation was.
+    """
+    defaults = (True, 200, 0.5)
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        cfg = load_config()
+        enabled = cfg_get(cfg, "tool_loop_guardrails", "safe_write_enabled", default=True)
+        min_bytes = cfg_get(cfg, "tool_loop_guardrails", "safe_write_min_bytes", default=200)
+        ratio = cfg_get(cfg, "tool_loop_guardrails", "safe_write_shrink_ratio", default=0.5)
+    except Exception:
+        return defaults
+    if not isinstance(enabled, bool):
+        enabled = True
+    try:
+        min_bytes = int(min_bytes)
+    except (TypeError, ValueError):
+        min_bytes = 200
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError):
+        ratio = 0.5
+    if min_bytes < 0:
+        min_bytes = 200
+    if not (0.0 < ratio <= 1.0):
+        ratio = 0.5
+    return enabled, min_bytes, ratio
+
+
+def _destructive_write_decision(file_ops, write_path: str, display_path: str,
+                                content: str) -> str | None:
+    """Refuse a write_file that would blank an existing file, else ``None``.
+
+    The 2026-06-09 failure: STATUS.md and a full research report were wiped by
+    a write_file that carried a fraction of the intended content. Nothing in
+    the runtime noticed — the write "succeeded".
+
+    MUST be called after path resolution and with the SAME ``file_ops`` and
+    ``write_path`` that the write itself will use. The size is measured through
+    the backend (:meth:`FileOperations.file_size`), never through a host stat:
+    the 2026-06 version did ``os.path.getsize(expanduser(raw_path))`` before
+    task/backend resolution, which answers about the wrong file on relative
+    paths and on container/remote backends. That defect is precisely why it was
+    rejected on 2026-08-05 (thread ``hermes-runtime-guards-20260804``).
+
+    Fails OPEN in every uncertain case — unknown size, unreadable path, backend
+    that cannot answer. A guard that cannot measure must not block a write.
+    """
+    enabled, min_bytes, shrink_ratio = _safe_write_config()
+    if not enabled or not isinstance(content, str):
+        return None
+    probe = getattr(file_ops, "file_size", None)
+    if not callable(probe):
+        return None  # backend cannot answer → fail open
+    try:
+        existing = probe(write_path)
+    except Exception:
+        return None
+    if not isinstance(existing, int) or existing < min_bytes:
+        # Absent, non-regular, unknown, or trivially small → nothing to protect.
+        return None
+    new_bytes = len(content.encode("utf-8"))
+    if new_bytes >= existing * shrink_ratio:
+        return None
+    pct = int(round(new_bytes * 100 / existing)) if existing else 0
+    return (
+        f"Refusing to overwrite '{display_path}' ({existing} bytes) with only "
+        f"{new_bytes} bytes ({pct}% of the current file). This matches the "
+        "accidental-blanking failure: a file is replaced by a fraction of "
+        "itself and the write reports success. Read the file and write the "
+        "full intended content. If the shrink is deliberate, re-issue this "
+        "call with allow_shrink=true."
+    )
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
-                    session_id: str | None = None) -> str:
+                    session_id: str | None = None,
+                    allow_shrink: bool = False) -> str:
     """Write content to a file.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
@@ -2229,6 +2320,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     skills/plugins/cron/memories directory; everything else is unaffected.
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
+
+    ``allow_shrink`` opts out of the safe-write guard, which refuses a write
+    that replaces an existing file with a small fraction of itself (see
+    :func:`_destructive_write_decision`). Same shape as ``cross_profile``: it
+    turns a silent accident into an explicit choice, it does not forbid the
+    operation. The size is measured through the write backend, after path
+    resolution.
     """
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
@@ -2264,6 +2362,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
+            if not allow_shrink:
+                shrink_err = _destructive_write_decision(
+                    file_ops, path, path, content)
+                if shrink_err:
+                    return tool_error(shrink_err)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             if stale_warning:
@@ -2285,6 +2388,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
+            if not allow_shrink:
+                shrink_err = _destructive_write_decision(
+                    file_ops, _resolved, _resolved, content)
+                if shrink_err:
+                    return tool_error(shrink_err)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
@@ -2676,6 +2784,11 @@ WRITE_FILE_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                 "default": False,
             },
+            "allow_shrink": {
+                "type": "boolean",
+                "description": "Opt out of the safe-write guard, which refuses replacing an existing file with a small fraction of its current size (the accidental-blanking failure). Defaults to false. Set true only when the shrink is intended — deleting most of a file on purpose, or replacing it with a genuinely shorter version. If you did NOT mean to shrink the file, read it first and write the full content instead of setting this flag.",
+                "default": False,
+            },
         },
         "required": ["path", "content"]
     }
@@ -2781,6 +2894,7 @@ def _handle_write_file(args, **kw):
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
+        allow_shrink=bool(args.get("allow_shrink", False)),
     )
 
 
