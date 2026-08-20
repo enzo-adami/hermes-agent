@@ -1283,6 +1283,47 @@ def clear_task_env_overrides(task_id: str):
         _container_aliases.pop(task_id, None)
 
 
+def _reset_for_tests() -> None:
+    """Clear all per-task/session terminal state. **Test-only.**
+
+    These module dicts are process-global. A test that records a session cwd,
+    registers a task override, or causes a real environment to be created
+    leaves an entry behind that outlives it — nothing in production drops one
+    except an explicit ``clear_task_env_overrides``/``cleanup_vm``. Under the
+    per-file subprocess runner (``scripts/run_tests_parallel.py``) that is
+    invisible, but a plain ``pytest tests/tools/`` shares one interpreter and
+    the entry becomes another file's input: ``_session_cwd`` is step 1 of
+    ``file_tools._resolve_base_dir`` (ahead of ``$TERMINAL_CWD``) and
+    ``_active_environments`` is what ``_terminal_env_type_for_task`` reads to
+    pick the container-vs-host branch. Both silently re-route path resolution.
+
+    This is the single reset seam so tests stop hand-rolling one
+    ``monkeypatch.setattr`` per dict and stop forgetting one.
+
+    Does NOT tear environments down: the tracking dicts are cleared but
+    ``env.cleanup()`` is not called, matching what the hand-rolled
+    ``monkeypatch.setattr(terminal_tool, "_active_environments", {})`` already
+    did. A test that creates a REAL container-backed env must still call
+    ``cleanup_vm()`` itself.
+    """
+    with _session_cwd_lock:
+        _session_cwd.clear()
+    _task_env_overrides.clear()
+    with _env_lock:
+        _active_environments.clear()
+        _last_activity.clear()
+    with _creation_locks_lock:
+        _creation_locks.clear()
+    with _container_alias_lock:
+        _container_aliases.clear()
+    try:
+        from tools.file_tools import clear_file_ops_cache
+
+        clear_file_ops_cache()
+    except ImportError:
+        pass
+
+
 # Subagent → parent container aliasing.  delegate_task children get their own
 # task_id (file-state tracking, TUI events) but must share the PARENT
 # session's container — one bash, one /workspace, one set of installed

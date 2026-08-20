@@ -14,6 +14,46 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _reset_terminal_task_state():
+    """Keep per-task terminal state from crossing test boundaries.
+
+    ``terminal_tool._session_cwd`` / ``_task_env_overrides`` /
+    ``_active_environments`` are process-global dicts, and nothing in
+    production drops an entry except an explicit ``clear_task_env_overrides``
+    or ``cleanup_vm``. Two of them feed path resolution directly:
+    ``_session_cwd`` is step 1 of ``file_tools._resolve_base_dir`` (ahead of
+    ``$TERMINAL_CWD``), and ``_active_environments`` is what
+    ``_terminal_env_type_for_task`` reads to pick the container-vs-host
+    branch. A leaked entry silently re-anchors a later test's writes.
+
+    The per-file subprocess runner (``scripts/run_tests_parallel.py``) hides
+    this — each file gets a clean interpreter — but a plain
+    ``pytest tests/tools/`` shares one, and that is how the class shows up:
+    ``test_resolve_path.py`` failed against a tmp_path belonging to
+    ``test_file_tools_cwd_resolution.py``.
+
+    Measured before this fixture existed: 22 of 483 files in this directory
+    ended dirty. Most were not author sloppiness — exercising the file tools
+    for real lazily creates a local env under ``"default"``, so demanding
+    each file clean up after itself would be a standing tax on normal test
+    writing. Resetting centrally is the cheaper contract.
+
+    Reset on both sides: entry protects this test from an inbound leak, exit
+    protects everyone downstream from ours.
+    """
+    try:
+        from tools.terminal_tool import _reset_for_tests
+    except Exception:
+        yield
+        return
+    _reset_for_tests()
+    try:
+        yield
+    finally:
+        _reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _no_host_browser_use_cli():
     """Keep the host's browser-use/uvx install out of tests.
 
