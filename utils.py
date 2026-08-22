@@ -499,6 +499,12 @@ def _yaml_roundtrip_text(path: Path, data: Any, *, allow_unicode: bool = True) -
         rt.preserve_quotes = True
         rt.allow_unicode = allow_unicode
         rt.width = 4096  # ne jamais re-wrapper une ligne existante
+        # Coller au style de l IndentDumper PyYAML : les sequences sont
+        # indentees sous leur cle. Sans ca le round-trip reindente TOUT le
+        # fichier — semantiquement identique, mais un diff de plusieurs
+        # centaines de lignes pour un changement d une valeur, c est du bruit
+        # qui noie le vrai changement dans une revue.
+        rt.indent(mapping=2, sequence=4, offset=2)
         with path.open(encoding="utf-8") as fh:
             current = rt.load(fh)
         if not isinstance(current, dict):
@@ -592,6 +598,15 @@ def atomic_yaml_write(
             _rt = _yaml_roundtrip_text(path, data, allow_unicode=True)
             if _rt is not None:
                 f.write(_rt)
+                # extra_content est appendu a CHAQUE ecriture. Tant que le dump
+                # repartait de zero, le bloc precedent etait efface puis remis :
+                # une seule copie. Maintenant qu on preserve les commentaires, le
+                # bloc deja present survit — le re-appendre le DUPLIQUE (observe
+                # sur config.yaml : le bloc Fallback Model ecrit 2x par la
+                # migration v37, qui ecrit deux fois). On ne le remet que s il
+                # n est pas deja la.
+                if extra_content and extra_content.strip() in _rt:
+                    extra_content = None
             else:
                 yaml.dump(
                     data,
