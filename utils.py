@@ -472,6 +472,66 @@ class IndentDumper(yaml.SafeDumper):
         return super().increase_indent(flow, False)
 
 
+def _yaml_roundtrip_text(path: Path, data: Any, *, allow_unicode: bool = True) -> "str | None":
+    """Render *data* as YAML while KEEPING the comments already in *path*.
+
+    Why this exists: a plain ``yaml.dump`` rebuilds the document from scratch,
+    so every comment in the target file dies on each write. That silently
+    destroyed hand-curated configs on every ``hermes config set`` and on every
+    schema migration — the version stamp alone is enough to trigger a rewrite.
+
+    Strategy: load the existing file with ruamel's round-trip loader (which
+    carries comments, key order and formatting on the tree), overlay *data*
+    onto it key by key, and emit. Keys absent from *data* are DELETED, so a
+    migration that removes a key still removes it.
+
+    Returns ``None`` whenever there is nothing to preserve or anything at all
+    looks off — the caller then falls back to the plain dump. Failing back to
+    the previous behaviour is always safe; failing forward is not.
+    """
+    try:
+        if not path.exists() or not isinstance(data, dict):
+            return None
+        from ruamel.yaml import YAML
+        import io
+
+        rt = YAML()
+        rt.preserve_quotes = True
+        rt.allow_unicode = allow_unicode
+        rt.width = 4096  # ne jamais re-wrapper une ligne existante
+        with path.open(encoding="utf-8") as fh:
+            current = rt.load(fh)
+        if not isinstance(current, dict):
+            return None
+
+        def overlay(dst, src):
+            for key in [k for k in list(dst.keys()) if k not in src]:
+                del dst[key]          # une migration qui supprime doit supprimer
+            for key, value in src.items():
+                if (
+                    key in dst
+                    and isinstance(dst.get(key), dict)
+                    and isinstance(value, dict)
+                ):
+                    overlay(dst[key], value)
+                else:
+                    dst[key] = value  # scalaires et listes : remplacement franc
+            return dst
+
+        overlay(current, data)
+        buf = io.StringIO()
+        rt.dump(current, buf)
+        text = buf.getvalue()
+
+        # Garde-fou : le rendu doit se relire et redonner exactement ce qu on
+        # voulait ecrire. Sinon on ne prend pas le risque et on retombe.
+        if yaml.safe_load(text) != yaml.safe_load(yaml.dump(data, allow_unicode=True, sort_keys=False)):
+            return None
+        return text
+    except Exception:
+        return None
+
+
 def atomic_yaml_write(
     path: Union[str, Path],
     data: Any,
@@ -526,14 +586,21 @@ def atomic_yaml_write(
             # continuations — a structure that stricter/non-PyYAML parsers and
             # hand-edits routinely break into unclosed quotes, corrupting the whole
             # config (GitHub #51356).
-            yaml.dump(
-                data,
-                f,
-                Dumper=IndentDumper,
-                default_flow_style=default_flow_style,
-                sort_keys=sort_keys,
-                allow_unicode=True,
-            )
+            # Round-trip preservant les commentaires quand la cible existe deja ;
+            # repli sur le dump historique sinon (fichier neuf, illisible, ou
+            # moindre doute — voir _yaml_roundtrip_text).
+            _rt = _yaml_roundtrip_text(path, data, allow_unicode=True)
+            if _rt is not None:
+                f.write(_rt)
+            else:
+                yaml.dump(
+                    data,
+                    f,
+                    Dumper=IndentDumper,
+                    default_flow_style=default_flow_style,
+                    sort_keys=sort_keys,
+                    allow_unicode=True,
+                )
             if extra_content:
                 f.write(extra_content)
             f.flush()
