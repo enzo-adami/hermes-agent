@@ -73,15 +73,17 @@ jobs:
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
           sparse-checkout-cone-mode: false
       - id: pick
+        env:
+          TAG_COUNT: ${{ github.event.inputs['tag-count'] || '5' }}
         run: |
           set -euo pipefail
-          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
+          tags="$(scripts/sandbox/pick-release-tags.sh --count "$TAG_COUNT")"
           echo "Testing updates from: $tags"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
   # `hermes update` -- the route most users take.
   update:
-    if: github.event_name != 'workflow_dispatch' || inputs.route != 'installer'
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.route != 'installer'
     needs: pick-releases
     strategy:
       # One release breaking is worth knowing about even if another already
@@ -97,7 +99,7 @@ jobs:
   # Re-running the curl one-liner over an existing checkout: autostash + pull
   # rather than the updater's own git handling.
   installer:
-    if: github.event_name != 'workflow_dispatch' || inputs.route != 'update'
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.route != 'update'
     needs: pick-releases
     strategy:
       fail-fast: false
