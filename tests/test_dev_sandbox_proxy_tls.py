@@ -182,3 +182,56 @@ def test_tls_relay_drains_ssl_pending_without_fd_readiness(monkeypatch, tmp_path
     )
 
     assert client.sent.endswith(b"ok")
+
+
+def test_connect_bypasses_tls_for_hosts_without_fixtures(monkeypatch, tmp_path) -> None:
+    """High-volume public hosts must remain opaque raw CONNECT tunnels."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    class _Upstream:
+        def close(self):
+            observed["closed"] = True
+
+    upstream = _Upstream()
+    observed = {}
+
+    monkeypatch.setattr(
+        proxy.socket,
+        "create_connection",
+        lambda address, timeout: observed.update(address=address) or upstream,
+    )
+    monkeypatch.setattr(
+        proxy,
+        "relay_raw_duplex",
+        lambda left, right: observed.update(relay=(left, right)),
+        raising=False,
+    )
+
+    class _Client:
+        def sendall(self, data):
+            observed["response"] = data
+
+    client = _Client()
+    proxy.handle_connect(client, "registry.npmjs.org:443")
+
+    assert observed["address"] == ("registry.npmjs.org", 443)
+    assert observed["relay"] == (client, upstream)
+    assert observed["response"].startswith(b"HTTP/1.1 200")
+    assert observed["closed"] is True
+
+
+def test_connect_keeps_mitm_for_fixture_hosts(monkeypatch, tmp_path) -> None:
+    """The canonical installer fixture must still terminate TLS at the proxy."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    (proxy.ROOT / "hermes-agent.nousresearch.com").mkdir()
+    observed = {}
+
+    monkeypatch.setattr(
+        proxy,
+        "intercept_connect",
+        lambda conn, host, port: observed.update(args=(conn, host, port)),
+        raising=False,
+    )
+    client = object()
+    proxy.handle_connect(client, "hermes-agent.nousresearch.com:443")
+
+    assert observed["args"] == (client, "hermes-agent.nousresearch.com", 443)

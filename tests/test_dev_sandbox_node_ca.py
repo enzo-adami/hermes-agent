@@ -10,17 +10,26 @@ INSTALL_E2E = REPO_ROOT / "tests" / "install" / "install-update-e2e.sh"
 INSTALL_E2E_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "install-e2e-run.yml"
 
 
-def test_node_trusts_the_proxy_ca_for_https_requests() -> None:
-    """npm must trust the certificate minted by the sandbox MITM proxy.
+def test_sandbox_clients_trust_proxy_and_public_certificate_authorities() -> None:
+    """Clients must trust both fixture MITM and transparent upstream TLS.
 
-    The proxy terminates TLS with ``ca.pem`` before opening its own verified
-    upstream connection. Pointing Node at ``real-ca.pem`` instead makes every
-    npm HTTPS request reject the proxy certificate, while the proxy only logs
-    the client's TLS EOF and npm's captured log can be empty on timeout.
+    Fixture hosts terminate TLS at the proxy with ``ca.pem``. Non-fixture hosts
+    are raw CONNECT tunnels, so their public certificates require the system CA
+    bundle. The generated combined bundle is therefore the only correct trust
+    boundary for curl, Python, Git, and Node.
     """
+    stage1 = STAGE1.read_text(encoding="utf-8")
     text = STAGE2.read_text(encoding="utf-8")
 
-    assert "--setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem" in text
+    assert "combined-ca.pem" in stage1
+    for variable in (
+        "CURL_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "GIT_SSL_CAINFO",
+        "NODE_EXTRA_CA_CERTS",
+    ):
+        assert f"--setenv {variable} /work/certs/combined-ca.pem" in text
+    assert "--setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem" not in text
     assert "--setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem" not in text
 
 
