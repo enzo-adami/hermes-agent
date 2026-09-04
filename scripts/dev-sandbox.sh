@@ -310,9 +310,9 @@ if [ ! -f "$REAL_CA_CERT" ]; then
   echo 'error: no system CA bundle found for outbound sandbox HTTPS' >&2
   exit 1
 fi
-if [ ! -f "$SANDBOX_ROOT/root/certs/real-ca.pem" ]; then
-  cp "$REAL_CA_CERT" "$SANDBOX_ROOT/root/certs/real-ca.pem"
-fi
+# Persistent sandboxes must follow CA bundle changes on the host and explicit
+# DEV_SANDBOX_REAL_CA_CERT overrides between runs.
+cp "$REAL_CA_CERT" "$SANDBOX_ROOT/root/certs/real-ca.pem"
 printf 'nameserver 10.0.2.3\n' > "$SANDBOX_ROOT/etc/resolv.conf"
 SANDBOX_SHELL="$(command -v bash)"
 DYNAMIC_LINKER="${DEV_SANDBOX_DYNAMIC_LINKER:-}"

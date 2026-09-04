@@ -2329,7 +2329,10 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local npm_log
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+        # Output is already captured and only printed on failure. Do not pass
+        # --silent: it suppresses the npm error that this diagnostic path exists
+        # to preserve, leaving CI and users with an unexplained non-zero exit.
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install \
                 >"$npm_log" 2>&1; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import socket
 import ssl
 import sys
 import threading
@@ -235,3 +236,79 @@ def test_connect_keeps_mitm_for_fixture_hosts(monkeypatch, tmp_path) -> None:
     proxy.handle_connect(client, "hermes-agent.nousresearch.com:443")
 
     assert observed["args"] == (client, "hermes-agent.nousresearch.com", 443)
+
+
+def test_connect_normalizes_dns_case_before_fixture_routing(monkeypatch, tmp_path) -> None:
+    """Mixed-case DNS names must not bypass a lowercase fixture directory."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    (proxy.ROOT / "hermes-agent.nousresearch.com").mkdir()
+    observed = {}
+    monkeypatch.setattr(
+        proxy,
+        "intercept_connect",
+        lambda conn, host, port: observed.update(args=(conn, host, port)),
+    )
+
+    client = object()
+    proxy.handle_connect(client, "Hermes-Agent.NousResearch.COM:443")
+
+    assert observed["args"] == (client, "hermes-agent.nousresearch.com", 443)
+
+
+def test_non_fixture_connect_relays_real_full_duplex_bytes(monkeypatch, tmp_path) -> None:
+    """Transparent CONNECT preserves large payloads and propagates half-closes."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    proxy_side, client = socket.socketpair()
+    upstream_for_proxy, upstream = socket.socketpair()
+    monkeypatch.setattr(
+        proxy.socket,
+        "create_connection",
+        lambda address, timeout: upstream_for_proxy,
+    )
+    monkeypatch.setattr(
+        proxy,
+        "intercept_connect",
+        lambda *args: (_ for _ in ()).throw(AssertionError("unexpected MITM")),
+    )
+
+    worker = threading.Thread(
+        target=proxy.handle_connect,
+        args=(proxy_side, "registry.npmjs.org:443"),
+    )
+    worker.start()
+    response = client.recv(4096)
+    assert response == b"HTTP/1.1 200 Connection Established\r\n\r\n"
+
+    client_payload = b"client" * (proxy.MAX_REQUEST_BYTES + 1)
+    upstream_payload = b"upstream" * (proxy.MAX_REQUEST_BYTES + 1)
+    received = {}
+
+    def send_then_half_close(sock, payload):
+        sock.sendall(payload)
+        sock.shutdown(socket.SHUT_WR)
+
+    def drain(sock, key):
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+        received[key] = b"".join(chunks)
+
+    threads = [
+        threading.Thread(target=send_then_half_close, args=(client, client_payload)),
+        threading.Thread(target=send_then_half_close, args=(upstream, upstream_payload)),
+        threading.Thread(target=drain, args=(client, "client")),
+        threading.Thread(target=drain, args=(upstream, "upstream")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    assert received["upstream"] == client_payload
+    assert received["client"] == upstream_payload
+    client.close()
+    upstream.close()
+    proxy_side.close()

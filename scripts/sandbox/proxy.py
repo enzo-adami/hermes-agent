@@ -440,6 +440,9 @@ def fixture_host_exists(host):
 def handle_connect(conn, target):
     """MITM fixture hosts and transparently tunnel every other TLS host."""
     host, _, port_text = target.rpartition(':')
+    # DNS names are case-insensitive, while fixture lookup on Linux is not.
+    # Canonicalize once so mixed-case authorities cannot bypass fixtures.
+    host = host.lower()
     port = int(port_text or '443')
     if fixture_host_exists(host):
         intercept_connect(conn, host, port)
