@@ -473,6 +473,14 @@ def parse_connect_authority(target):
         if target.count(':') != 1:
             raise ValueError('CONNECT authority requires host:port')
         host, port_text = target.split(':', 1)
+        # A trailing root dot and Unicode DNS labels are valid.  Canonicalize
+        # to the same lower-case A-label form used by fixture directories and
+        # by DNS, then validate the filesystem-facing representation.
+        host = host[:-1] if host.endswith('.') else host
+        try:
+            host = host.encode('idna').decode('ascii').lower()
+        except UnicodeError as error:
+            raise ValueError('invalid CONNECT hostname') from error
         if len(host) > 253 or not re.fullmatch(r'[A-Za-z0-9.-]+', host):
             raise ValueError('invalid CONNECT hostname')
         labels = host.split('.')
