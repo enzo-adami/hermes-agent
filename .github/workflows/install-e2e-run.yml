@@ -93,6 +93,9 @@ jobs:
           # dirty -- which dev-sandbox reacts to by snapshotting the working
           # copy into a fresh fake-main commit on every invocation, moving the
           # update target mid-run.
+          # Authenticate the release-asset lookup in every matrix leg. The
+          # script passes this token only as a curl header; GitHub masks it.
+          GITHUB_TOKEN: ${{ github.token }}
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
 
       # Artifact names cannot contain '/', and install-ref may be a full ref

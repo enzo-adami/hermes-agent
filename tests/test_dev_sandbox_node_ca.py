@@ -6,6 +6,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STAGE1 = REPO_ROOT / "scripts" / "dev-sandbox.sh"
 STAGE2 = REPO_ROOT / "scripts" / "sandbox" / "stage2-run.sh"
+INSTALL_E2E = REPO_ROOT / "tests" / "install" / "install-update-e2e.sh"
+INSTALL_E2E_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "install-e2e-run.yml"
 
 
 def test_node_trusts_the_proxy_ca_for_https_requests() -> None:
@@ -48,3 +50,28 @@ def test_release_submodules_are_prefetched_outside_the_tls_proxy() -> None:
     assert "symbolic-ref HEAD refs/heads/sandbox" in text
     assert 'submodule_keys="$(git config' in text
     assert "done < <(git config" not in text
+
+
+def test_managed_python_tarball_is_prefetched_for_the_sandbox() -> None:
+    """uv's managed Python download must not cross the flaky TLS proxy."""
+    text = INSTALL_E2E.read_text(encoding="utf-8")
+
+    assert "astral-sh/python-build-standalone/releases/latest" in text
+    assert "install_only_stripped" in text
+    assert 'github.com/astral-sh/python-build-standalone' in text
+
+
+def test_managed_python_api_auth_uses_the_runtime_token() -> None:
+    """The release API request must not send a placeholder credential."""
+    text = INSTALL_E2E.read_text(encoding="utf-8")
+
+    assert 'Authorization: Bearer $GITHUB_TOKEN' in text
+    assert 'Authorization: Bearer $GH_TOKEN' in text
+    assert 'Authorization: Bearer ***' not in text
+
+
+def test_install_e2e_workflow_exposes_the_github_token() -> None:
+    """Each reusable matrix leg must receive an authenticated API token."""
+    text = INSTALL_E2E_WORKFLOW.read_text(encoding="utf-8")
+
+    assert 'GITHUB_TOKEN: ${{ github.token }}' in text
