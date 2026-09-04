@@ -8,19 +8,31 @@ STAGE1 = REPO_ROOT / "scripts" / "dev-sandbox.sh"
 STAGE2 = REPO_ROOT / "scripts" / "sandbox" / "stage2-run.sh"
 INSTALL_E2E = REPO_ROOT / "tests" / "install" / "install-update-e2e.sh"
 INSTALL_E2E_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "install-e2e-run.yml"
+INSTALLER = REPO_ROOT / "scripts" / "install.sh"
 
 
-def test_node_trusts_the_proxy_ca_for_https_requests() -> None:
-    """npm must trust the certificate minted by the sandbox MITM proxy.
+def test_sandbox_clients_trust_proxy_and_public_certificate_authorities() -> None:
+    """Clients must trust both fixture MITM and transparent upstream TLS.
 
-    The proxy terminates TLS with ``ca.pem`` before opening its own verified
-    upstream connection. Pointing Node at ``real-ca.pem`` instead makes every
-    npm HTTPS request reject the proxy certificate, while the proxy only logs
-    the client's TLS EOF and npm's captured log can be empty on timeout.
+    Fixture hosts terminate TLS at the proxy with ``ca.pem``. Non-fixture hosts
+    are raw CONNECT tunnels, so their public certificates require the system CA
+    bundle. The generated combined bundle is therefore the only correct trust
+    boundary for curl, Python, Git, and Node.
     """
+    stage1 = STAGE1.read_text(encoding="utf-8")
     text = STAGE2.read_text(encoding="utf-8")
 
-    assert "--setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem" in text
+    assert "combined-ca.pem" in stage1
+    assert 'cp "$REAL_CA_CERT" "$SANDBOX_ROOT/root/certs/real-ca.pem"' in stage1
+    assert 'if [ ! -f "$SANDBOX_ROOT/root/certs/real-ca.pem" ]; then' not in stage1
+    for variable in (
+        "CURL_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "GIT_SSL_CAINFO",
+        "NODE_EXTRA_CA_CERTS",
+    ):
+        assert f"--setenv {variable} /work/certs/combined-ca.pem" in text
+    assert "--setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem" not in text
     assert "--setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem" not in text
 
 
@@ -75,3 +87,19 @@ def test_install_e2e_workflow_exposes_the_github_token() -> None:
     text = INSTALL_E2E_WORKFLOW.read_text(encoding="utf-8")
 
     assert 'GITHUB_TOKEN: ${{ github.token }}' in text
+
+
+def test_node_dependency_failure_keeps_npm_diagnostics() -> None:
+    """Captured npm failures must not be silenced before the log is printed."""
+    text = INSTALLER.read_text(encoding="utf-8")
+
+    assert 'npm install --silent \\\n                >"$npm_log"' not in text
+    assert 'npm install \\\n                >"$npm_log"' in text
+
+
+def test_sandbox_does_not_force_host_node_headers_on_managed_node() -> None:
+    """A user install must let node-gyp resolve headers for its managed Node."""
+    stage1 = STAGE1.read_text(encoding="utf-8")
+
+    assert 'NODE_DIR="${DEV_SANDBOX_NODE_DIR:-}"' in stage1
+    assert 'NODE_DIR="$(dirname "$(dirname "$(command -v node)")")"' not in stage1

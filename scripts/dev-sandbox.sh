@@ -310,9 +310,9 @@ if [ ! -f "$REAL_CA_CERT" ]; then
   echo 'error: no system CA bundle found for outbound sandbox HTTPS' >&2
   exit 1
 fi
-if [ ! -f "$SANDBOX_ROOT/root/certs/real-ca.pem" ]; then
-  cp "$REAL_CA_CERT" "$SANDBOX_ROOT/root/certs/real-ca.pem"
-fi
+# Persistent sandboxes must follow CA bundle changes on the host and explicit
+# DEV_SANDBOX_REAL_CA_CERT overrides between runs.
+cp "$REAL_CA_CERT" "$SANDBOX_ROOT/root/certs/real-ca.pem"
 printf 'nameserver 10.0.2.3\n' > "$SANDBOX_ROOT/etc/resolv.conf"
 SANDBOX_SHELL="$(command -v bash)"
 DYNAMIC_LINKER="${DEV_SANDBOX_DYNAMIC_LINKER:-}"
@@ -521,6 +521,13 @@ if [ ! -f "$SANDBOX_ROOT/root/certs/ca.pem" ]; then
     exit 1
   fi
 fi
+# Fixture hosts terminate TLS at the proxy, while all other CONNECT requests
+# remain transparent tunnels to the public endpoint. Give clients both trust
+# roots: the throwaway sandbox CA for fixtures and the host system bundle for
+# untouched upstream certificates.
+cat "$SANDBOX_ROOT/root/certs/ca.pem" \
+    "$SANDBOX_ROOT/root/certs/real-ca.pem" \
+    > "$SANDBOX_ROOT/root/certs/combined-ca.pem"
 GIT_UPLOAD_PACK="$(command -v git-upload-pack)"
 sed "s|@GIT_UPLOAD_PACK@|$GIT_UPLOAD_PACK|" "$SANDBOX_ASSETS/ssh-shim.sh" \
   > "$SANDBOX_ROOT/root/usr/bin/ssh"
@@ -557,10 +564,11 @@ INTERACTIVE=false
 if [ -t 0 ] && [ -t 1 ]; then
   INTERACTIVE=true
 fi
+# Do not infer node-gyp headers from the host's `node`. A user-level installer
+# may replace it with a Hermes-managed Node inside the sandbox; forcing the host
+# prefix then makes native addons read a mismatched or nonexistent common.gypi.
+# Explicit overrides remain available for hermetic Nix/dev-shell callers.
 NODE_DIR="${DEV_SANDBOX_NODE_DIR:-}"
-if [ -z "$NODE_DIR" ] && command -v node >/dev/null; then
-  NODE_DIR="$(dirname "$(dirname "$(command -v node)")")"
-fi
 WAYLAND_SOCKET=""
 if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
   && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then

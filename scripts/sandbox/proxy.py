@@ -19,6 +19,7 @@ Usage: proxy.py <fixture-root> <certs-dir> <real-ca-bundle>
 
 import os
 import pathlib
+import select
 import socket
 import ssl
 import subprocess
@@ -163,15 +164,219 @@ def relay(source, destination):
         destination.sendall(chunk)
 
 
+def relay_raw_duplex(left, right):
+    """Relay a transparent CONNECT tunnel without terminating its TLS.
+
+    Raw TCP sockets support full-duplex I/O, but a single readiness loop also
+    gives deterministic half-close and teardown behavior without extra threads.
+    """
+    peers = {left: right, right: left}
+    outgoing = {left: bytearray(), right: bytearray()}
+    read_open = {left: True, right: True}
+    write_shutdown = set()
+    last_activity = time.monotonic()
+
+    left.setblocking(False)
+    right.setblocking(False)
+
+    while any(read_open.values()) or any(outgoing.values()):
+        readers = [
+            source
+            for source, destination in peers.items()
+            if read_open[source] and not outgoing[destination]
+        ]
+        writers = [destination for destination, data in outgoing.items() if data]
+        remaining = UPSTREAM_IDLE_SECONDS - (time.monotonic() - last_activity)
+        if remaining <= 0:
+            return
+        try:
+            readable, writable, exceptional = select.select(
+                readers,
+                writers,
+                [left, right],
+                min(1.0, remaining),
+            )
+        except OSError:
+            return
+        if exceptional:
+            return
+
+        progressed = False
+        for source in readable:
+            destination = peers[source]
+            try:
+                chunk = source.recv(MAX_REQUEST_BYTES)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                return
+            if chunk:
+                outgoing[destination].extend(chunk)
+                progressed = True
+            else:
+                read_open[source] = False
+
+        for destination in writable:
+            try:
+                sent = destination.send(outgoing[destination])
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                return
+            if not sent:
+                return
+            del outgoing[destination][:sent]
+            progressed = True
+
+        # Propagate EOF only after bytes already read from that source have
+        # drained to its peer.
+        for source, destination in peers.items():
+            if (
+                not read_open[source]
+                and not outgoing[destination]
+                and destination not in write_shutdown
+            ):
+                try:
+                    destination.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                write_shutdown.add(destination)
+
+        if progressed:
+            last_activity = time.monotonic()
+
+
+def relay_tls(client, upstream, initial_upstream):
+    """Relay application bytes without concurrent access to either SSLSocket.
+
+    OpenSSL does not support SSL_read and SSL_write concurrently on one SSL
+    object. CPython #151508 demonstrates that doing so can corrupt native state
+    and segfault. A readiness-driven loop keeps both directions on this handler
+    thread while retaining HTTP keep-alive support.
+    """
+    peers = {client: upstream, upstream: client}
+    outgoing = {client: bytearray(), upstream: bytearray(initial_upstream)}
+    send_need = {client: 'write', upstream: 'write'}
+    recv_need = {client: 'read', upstream: 'read'}
+    last_activity = time.monotonic()
+
+    client.setblocking(False)
+    upstream.setblocking(False)
+
+    while True:
+        readers = []
+        writers = []
+        immediately_readable = set()
+
+        for source, destination in peers.items():
+            # Read at most one TLS record ahead. Draining it before the next
+            # recv prevents an EOF on one side from discarding bytes already
+            # queued for the other side.
+            if outgoing[destination]:
+                continue
+            if recv_need[source] == 'write':
+                writers.append(source)
+            else:
+                try:
+                    if source.pending():
+                        immediately_readable.add(source)
+                    else:
+                        readers.append(source)
+                except OSError:
+                    return
+
+        for destination, buffered in outgoing.items():
+            if not buffered:
+                continue
+            if send_need[destination] == 'read':
+                readers.append(destination)
+            else:
+                writers.append(destination)
+
+        remaining = UPSTREAM_IDLE_SECONDS - (time.monotonic() - last_activity)
+        if remaining <= 0:
+            return
+        try:
+            readable, writable, exceptional = select.select(
+                list(dict.fromkeys(readers)),
+                list(dict.fromkeys(writers)),
+                [client, upstream],
+                min(1.0, remaining),
+            )
+        except OSError:
+            return
+        if exceptional:
+            return
+
+        readable = set(readable) | immediately_readable
+        writable = set(writable)
+        progressed = False
+        send_attempted = set()
+
+        # Drain queued bytes before accepting more. This both applies
+        # backpressure and gives TLS control records needed by a pending write
+        # priority over application-level reads from the same SSL object.
+        for destination, buffered in outgoing.items():
+            if not buffered:
+                continue
+            need = send_need[destination]
+            if not ((need == 'read' and destination in readable) or
+                    (need != 'read' and destination in writable)):
+                continue
+            send_attempted.add(destination)
+            try:
+                sent = destination.send(buffered)
+            except ssl.SSLWantReadError:
+                send_need[destination] = 'read'
+                continue
+            except ssl.SSLWantWriteError:
+                send_need[destination] = 'write'
+                continue
+            except OSError:
+                return
+            if not sent:
+                return
+            del buffered[:sent]
+            send_need[destination] = 'write'
+            progressed = True
+
+        for source, destination in peers.items():
+            if outgoing[destination]:
+                continue
+            need = recv_need[source]
+            ready = (
+                source in immediately_readable
+                or (need == 'write' and source in writable)
+                or (need != 'write' and source in readable)
+            )
+            if not ready:
+                continue
+            if send_need[source] == 'read' and source in send_attempted:
+                continue
+            try:
+                chunk = source.recv(MAX_REQUEST_BYTES)
+            except ssl.SSLWantReadError:
+                recv_need[source] = 'read'
+                continue
+            except ssl.SSLWantWriteError:
+                recv_need[source] = 'write'
+                continue
+            except OSError:
+                return
+            if not chunk:
+                return
+            outgoing[destination].extend(chunk)
+            recv_need[source] = 'read'
+            progressed = True
+
+        if progressed:
+            last_activity = time.monotonic()
+
+
 def forward_https(conn, host, port, request):
-    # Keep the tunnel open for as long as BOTH peers want it: npm reuses
-    # keep-alive sockets aggressively, and serving a single request per
-    # CONNECT turns every reused socket into a dead tunnel (client sees
-    # unexpected EOF / SSLEOF; retries exhaust; install fails).
-    #
-    # Two pumps run concurrently: client->upstream (new requests) and
-    # upstream->client (responses). Each ends when its peer EOFs or errors;
-    # when either side finishes, the whole tunnel is torn down.
+    # Keep the tunnel open across HTTP keep-alive requests. The relay itself is
+    # single-threaded because one SSLSocket cannot safely be read and written
+    # from separate threads.
     context = ssl.create_default_context(cafile=str(REAL_CA))
     upstream = None
     # A transient upstream connect/TLS failure looks like "empty reply" to the
@@ -187,40 +392,9 @@ def forward_https(conn, host, port, request):
                 return
             time.sleep(1)
 
-    def c2u():
-        # Client requests: forward verbatim (minus hop-by-hop headers).
-        # `request` is the first one, already read by handle_connect.
-        try:
-            upstream.sendall(strip_proxy_headers(request))
-            while True:
-                req = read_request(conn)
-                if not req:
-                    break
-                upstream.sendall(strip_proxy_headers(req))
-        except OSError:
-            pass
-        finally:
-            try:
-                upstream.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-
-    t = threading.Thread(target=c2u, daemon=True)
-    t.start()
     try:
-        while True:
-            chunk = upstream.recv(65536)
-            if not chunk:
-                break
-            conn.sendall(chunk)
-    except OSError:
-        pass
+        relay_tls(conn, upstream, strip_proxy_headers(request))
     finally:
-        try:
-            conn.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-        t.join(timeout=5)
         upstream.close()
 
 
@@ -234,10 +408,8 @@ def forward_http(conn, host, port, request, target):
         relay(upstream, conn)
 
 
-def handle_connect(conn, target):
-    """Intercept a CONNECT tunnel, terminating TLS with a minted cert."""
-    host, _, port_text = target.rpartition(':')
-    port = int(port_text or '443')
+def intercept_connect(conn, host, port):
+    """Terminate TLS for a host whose responses may come from fixtures."""
     conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
     cert, key = cert_for(host)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -253,6 +425,37 @@ def handle_connect(conn, target):
             respond_fixture(tls, found)
         else:
             forward_https(tls, host, port, nested)
+
+
+def fixture_host_exists(host):
+    """Return whether HOST has any fixture paths, without path traversal."""
+    return (
+        host not in {'.', '..'}
+        and '/' not in host
+        and '\\' not in host
+        and (ROOT / host).is_dir()
+    )
+
+
+def handle_connect(conn, target):
+    """MITM fixture hosts and transparently tunnel every other TLS host."""
+    host, _, port_text = target.rpartition(':')
+    # DNS names are case-insensitive, while fixture lookup on Linux is not.
+    # Canonicalize once so mixed-case authorities cannot bypass fixtures.
+    host = host.lower()
+    port = int(port_text or '443')
+    if fixture_host_exists(host):
+        intercept_connect(conn, host, port)
+        return
+
+    upstream = socket.create_connection(
+        (host, port), timeout=UPSTREAM_IDLE_SECONDS
+    )
+    try:
+        conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+        relay_raw_duplex(conn, upstream)
+    finally:
+        upstream.close()
 
 
 def host_from_headers(request):
