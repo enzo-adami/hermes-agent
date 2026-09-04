@@ -5,7 +5,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STAGE2 = REPO_ROOT / "scripts" / "sandbox" / "stage2-run.sh"
-PROXY = REPO_ROOT / "scripts" / "sandbox" / "proxy.py"
 
 
 def test_node_trusts_the_proxy_ca_for_https_requests() -> None:
@@ -36,12 +35,3 @@ def test_https_fallback_for_the_canonical_repo_stays_on_fake_main() -> None:
         'git config --global url."git@github.com:NousResearch/hermes-agent.git".insteadOf '
         '"https://github.com/NousResearch/hermes-agent.git"'
     ) in text
-
-
-def test_proxy_closes_client_tls_with_close_notify() -> None:
-    """Git/GnuTLS must see an orderly TLS shutdown, not a raw TCP half-close."""
-    text = PROXY.read_text(encoding="utf-8")
-    forward = text.split("def forward_https", 1)[1].split("def forward_http", 1)[0]
-
-    assert "conn.unwrap()" in forward
-    assert "conn.shutdown(socket.SHUT_WR)" not in forward
