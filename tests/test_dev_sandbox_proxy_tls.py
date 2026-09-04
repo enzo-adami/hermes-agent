@@ -255,6 +255,89 @@ def test_connect_normalizes_dns_case_before_fixture_routing(monkeypatch, tmp_pat
     assert observed["args"] == (client, "hermes-agent.nousresearch.com", 443)
 
 
+def test_connect_normalizes_idna_and_root_dot_before_fixture_routing(
+    monkeypatch, tmp_path
+) -> None:
+    """Valid internationalized DNS authorities use canonical fixture names."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    (proxy.ROOT / "xn--bcher-kva.example").mkdir()
+    observed = {}
+    monkeypatch.setattr(
+        proxy,
+        "intercept_connect",
+        lambda conn, host, port: observed.update(args=(conn, host, port)),
+    )
+
+    client = object()
+    proxy.handle_connect(client, "BÜCHER.Example.:443")
+
+    assert observed["args"] == (client, "xn--bcher-kva.example", 443)
+
+
+def test_connect_rejects_malformed_authorities_before_routing(monkeypatch, tmp_path) -> None:
+    """Malformed CONNECT targets fail closed instead of reaching fixtures or DNS."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    routed = []
+    monkeypatch.setattr(
+        proxy.socket,
+        "create_connection",
+        lambda *args, **kwargs: routed.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        proxy,
+        "intercept_connect",
+        lambda *args: routed.append(args),
+    )
+
+    class _Client:
+        def __init__(self):
+            self.sent = bytearray()
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+    malformed = (
+        "",
+        ":443",
+        "registry.npmjs.org",
+        "registry.npmjs.org:0",
+        "registry.npmjs.org:65536",
+        "registry.npmjs.org:not-a-port",
+        "user@registry.npmjs.org:443",
+        "registry.npmjs.org/path:443",
+        "../registry.npmjs.org:443",
+        "registry.npmjs.org:\n443",
+        "[::1",
+    )
+    for target in malformed:
+        client = _Client()
+        proxy.handle_connect(client, target)
+        assert bytes(client.sent).startswith(b"HTTP/1.1 400 Bad Request"), target
+
+    assert routed == []
+
+
+def test_connect_reports_upstream_connection_failure(monkeypatch, tmp_path) -> None:
+    """A valid authority with an unreachable upstream receives an explicit 502."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        proxy.socket,
+        "create_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("unreachable")),
+    )
+
+    class _Client:
+        sent = bytearray()
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+    client = _Client()
+    proxy.handle_connect(client, "registry.npmjs.org:443")
+
+    assert bytes(client.sent).startswith(b"HTTP/1.1 502 Bad Gateway")
+
+
 def test_non_fixture_connect_relays_real_full_duplex_bytes(monkeypatch, tmp_path) -> None:
     """Transparent CONNECT preserves large payloads and propagates half-closes."""
     proxy = _load_proxy(monkeypatch, tmp_path)

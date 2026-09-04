@@ -17,8 +17,10 @@ throwaway CA, which the payload trusts via CURL_CA_BUNDLE / SSL_CERT_FILE.
 Usage: proxy.py <fixture-root> <certs-dir> <real-ca-bundle>
 """
 
+import ipaddress
 import os
 import pathlib
+import re
 import select
 import socket
 import ssl
@@ -437,20 +439,93 @@ def fixture_host_exists(host):
     )
 
 
+def parse_connect_authority(target):
+    """Return a validated ``(host, port)`` CONNECT authority.
+
+    CONNECT uses authority-form rather than a URL.  Validate it before either
+    filesystem fixture lookup or DNS so malformed input cannot accidentally
+    name the fixture root (the empty-host case) or escape into ambiguous
+    parsing.  Bracketed IPv6 is supported for transparent tunnels.
+    """
+    if (
+        not target
+        or any(ord(char) <= 32 or ord(char) == 127 for char in target)
+        or any(char in target for char in '/\\?#@%')
+    ):
+        raise ValueError('invalid CONNECT authority')
+
+    if target.startswith('['):
+        closing = target.find(']')
+        if (
+            closing <= 1
+            or target.count('[') != 1
+            or target.count(']') != 1
+            or target[closing + 1:closing + 2] != ':'
+        ):
+            raise ValueError('invalid bracketed CONNECT authority')
+        host = target[1:closing]
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError as error:
+            raise ValueError('invalid CONNECT IPv6 address') from error
+        port_text = target[closing + 2:]
+    else:
+        if target.count(':') != 1:
+            raise ValueError('CONNECT authority requires host:port')
+        host, port_text = target.split(':', 1)
+        # A trailing root dot and Unicode DNS labels are valid.  Canonicalize
+        # to the same lower-case A-label form used by fixture directories and
+        # by DNS, then validate the filesystem-facing representation.
+        host = host[:-1] if host.endswith('.') else host
+        try:
+            host = host.encode('idna').decode('ascii').lower()
+        except UnicodeError as error:
+            raise ValueError('invalid CONNECT hostname') from error
+        if len(host) > 253 or not re.fullmatch(r'[A-Za-z0-9.-]+', host):
+            raise ValueError('invalid CONNECT hostname')
+        labels = host.split('.')
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith('-')
+            or label.endswith('-')
+            for label in labels
+        ):
+            raise ValueError('invalid CONNECT hostname')
+
+    if not port_text.isascii() or not port_text.isdecimal():
+        raise ValueError('invalid CONNECT port')
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError('CONNECT port out of range')
+    return host.lower(), port
+
+
 def handle_connect(conn, target):
     """MITM fixture hosts and transparently tunnel every other TLS host."""
-    host, _, port_text = target.rpartition(':')
-    # DNS names are case-insensitive, while fixture lookup on Linux is not.
-    # Canonicalize once so mixed-case authorities cannot bypass fixtures.
-    host = host.lower()
-    port = int(port_text or '443')
+    try:
+        host, port = parse_connect_authority(target)
+    except ValueError:
+        conn.sendall(
+            b'HTTP/1.1 400 Bad Request\r\n'
+            b'Connection: close\r\nContent-Length: 0\r\n\r\n'
+        )
+        return
+
     if fixture_host_exists(host):
         intercept_connect(conn, host, port)
         return
 
-    upstream = socket.create_connection(
-        (host, port), timeout=UPSTREAM_IDLE_SECONDS
-    )
+    try:
+        upstream = socket.create_connection(
+            (host, port), timeout=UPSTREAM_IDLE_SECONDS
+        )
+    except OSError:
+        conn.sendall(
+            b'HTTP/1.1 502 Bad Gateway\r\n'
+            b'Connection: close\r\nContent-Length: 0\r\n\r\n'
+        )
+        return
     try:
         conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
         relay_raw_duplex(conn, upstream)
