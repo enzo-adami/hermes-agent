@@ -383,6 +383,83 @@ SOURCE_REF="$COMMIT"
 SNAPSHOT_REPO=""
 FAKE_REPO="$SANDBOX_ROOT/root/repos/hermes-agent.git"
 git -C "$SANDBOX_ROOT/root/repos" init --bare -q hermes-agent.git
+
+# Keep repository traffic that belongs to the fixture graph off the MITM
+# proxy. Older installers fall back from SSH to the canonical HTTPS URL and
+# clone top-level submodules recursively. Those HTTPS clones used to hit real
+# GitHub through the proxy, where a raw TLS close is fatal to Git/GnuTLS even
+# after a complete response. A sandbox E2E must also install the fake `main`,
+# not whichever object real GitHub happens to expose at that moment.
+GIT_CONFIG_FILE="$SANDBOX_ROOT/root/gitconfig"
+: > "$GIT_CONFIG_FILE"
+git config --file "$GIT_CONFIG_FILE" protocol.file.allow always
+git config --file "$GIT_CONFIG_FILE" \
+  url."git@github.com:NousResearch/hermes-agent.git".insteadOf \
+  "https://github.com/NousResearch/hermes-agent.git"
+
+# A few older release tags still contain top-level git submodules. Fetch the
+# exact gitlink commits outside the sandbox (with retries), expose them as local
+# bare mirrors, and rewrite only their declared URLs. This preserves the real
+# recursive-clone path while removing unrelated runner/proxy TLS variance.
+if [ -n "$INSTALL_REF" ]; then
+  gitmodules_file="$(mktemp -t hermes-sandbox-gitmodules.XXXXXX)"
+  if git -C "$UPSTREAM_REPO" show "$UPSTREAM_COMMIT:.gitmodules" \
+      > "$gitmodules_file" 2>/dev/null; then
+    if submodule_keys="$(git config --file "$gitmodules_file" --name-only \
+        --get-regexp '^submodule\..*\.url$')"; then
+      :
+    else
+      submodule_config_status=$?
+      if [ "$submodule_config_status" -eq 1 ]; then
+        submodule_keys=""
+      else
+        rm -f "$gitmodules_file"
+        echo "error: could not parse release .gitmodules" >&2
+        exit "$submodule_config_status"
+      fi
+    fi
+    while IFS= read -r submodule_key; do
+      [ -n "$submodule_key" ] || continue
+      submodule_name="${submodule_key#submodule.}"
+      submodule_name="${submodule_name%.url}"
+      submodule_url="$(git config --file "$gitmodules_file" --get "$submodule_key")"
+      submodule_path="$(git config --file "$gitmodules_file" \
+        --get "submodule.$submodule_name.path")"
+      read -r submodule_mode _submodule_type submodule_commit _submodule_path \
+        < <(git -C "$UPSTREAM_REPO" ls-tree "$UPSTREAM_COMMIT" -- "$submodule_path")
+      if [ "$submodule_mode" != 160000 ] || [ -z "$submodule_commit" ]; then
+        rm -f "$gitmodules_file"
+        echo "error: could not resolve submodule gitlink: $submodule_path" >&2
+        exit 1
+      fi
+
+      submodule_safe="$(printf '%s' "$submodule_name" | tr -c 'A-Za-z0-9._-' '_')"
+      submodule_mirror="$SANDBOX_ROOT/root/repos/submodules/$submodule_safe.git"
+      mkdir -p "$(dirname "$submodule_mirror")"
+      git init --bare -q "$submodule_mirror"
+      submodule_fetched=false
+      for _attempt in 1 2 3; do
+        if git --git-dir="$submodule_mirror" \
+            fetch -q --depth=1 "$submodule_url" \
+              "$submodule_commit:refs/heads/sandbox"; then
+          submodule_fetched=true
+          break
+        fi
+        sleep 2
+      done
+      if [ "$submodule_fetched" != true ]; then
+        rm -f "$gitmodules_file"
+        echo "error: could not prefetch submodule: $submodule_url@$submodule_commit" >&2
+        exit 1
+      fi
+      git --git-dir="$submodule_mirror" symbolic-ref HEAD refs/heads/sandbox
+      git config --file "$GIT_CONFIG_FILE" \
+        url."file:///work/repos/submodules/$submodule_safe.git".insteadOf \
+        "$submodule_url"
+    done <<< "$submodule_keys"
+  fi
+  rm -f "$gitmodules_file"
+fi
 if [ -n "$INSTALL_REF" ]; then
   git --git-dir="$FAKE_REPO" fetch -q --force "$UPSTREAM_REPO" \
     "$UPSTREAM_COMMIT:refs/heads/main"
