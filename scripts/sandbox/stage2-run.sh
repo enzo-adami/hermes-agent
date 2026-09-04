@@ -247,5 +247,10 @@ exec bwrap \
       cat /work/logs/proxy.log >&2 || true
       exit 1
     fi
+    # Older installers fall back from SSH to this canonical HTTPS URL. Keep
+    # that fallback on the sandbox-local fake main as well: reaching the real
+    # GitHub repository here both reintroduces external TLS flakiness and can
+    # install a tree different from the update target prepared by stage 1.
+    git config --global url."git@github.com:NousResearch/hermes-agent.git".insteadOf "https://github.com/NousResearch/hermes-agent.git"
     "$@"
   ' sandbox-command "$@"
