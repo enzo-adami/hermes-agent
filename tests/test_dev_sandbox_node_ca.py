@@ -46,3 +46,5 @@ def test_release_submodules_are_prefetched_outside_the_tls_proxy() -> None:
     assert 'url."file:///work/repos/submodules/' in text
     assert '"$submodule_commit:refs/heads/sandbox"' in text
     assert "symbolic-ref HEAD refs/heads/sandbox" in text
+    assert 'submodule_keys="$(git config' in text
+    assert "done < <(git config" not in text

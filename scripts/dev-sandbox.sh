@@ -405,7 +405,21 @@ if [ -n "$INSTALL_REF" ]; then
   gitmodules_file="$(mktemp -t hermes-sandbox-gitmodules.XXXXXX)"
   if git -C "$UPSTREAM_REPO" show "$UPSTREAM_COMMIT:.gitmodules" \
       > "$gitmodules_file" 2>/dev/null; then
+    if submodule_keys="$(git config --file "$gitmodules_file" --name-only \
+        --get-regexp '^submodule\..*\.url$')"; then
+      :
+    else
+      submodule_config_status=$?
+      if [ "$submodule_config_status" -eq 1 ]; then
+        submodule_keys=""
+      else
+        rm -f "$gitmodules_file"
+        echo "error: could not parse release .gitmodules" >&2
+        exit "$submodule_config_status"
+      fi
+    fi
     while IFS= read -r submodule_key; do
+      [ -n "$submodule_key" ] || continue
       submodule_name="${submodule_key#submodule.}"
       submodule_name="${submodule_name%.url}"
       submodule_url="$(git config --file "$gitmodules_file" --get "$submodule_key")"
@@ -442,8 +456,7 @@ if [ -n "$INSTALL_REF" ]; then
       git config --file "$GIT_CONFIG_FILE" \
         url."file:///work/repos/submodules/$submodule_safe.git".insteadOf \
         "$submodule_url"
-    done < <(git config --file "$gitmodules_file" --name-only \
-      --get-regexp '^submodule\..*\.url$')
+    done <<< "$submodule_keys"
   fi
   rm -f "$gitmodules_file"
 fi
