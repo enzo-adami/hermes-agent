@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+STAGE1 = REPO_ROOT / "scripts" / "dev-sandbox.sh"
 STAGE2 = REPO_ROOT / "scripts" / "sandbox" / "stage2-run.sh"
 
 
@@ -29,9 +30,19 @@ def test_https_fallback_for_the_canonical_repo_stays_on_fake_main() -> None:
     target depend on external TLS and can install a different tree than the
     fake ``main`` prepared by the sandbox.
     """
-    text = STAGE2.read_text(encoding="utf-8")
+    stage1 = STAGE1.read_text(encoding="utf-8")
+    stage2 = STAGE2.read_text(encoding="utf-8")
 
-    assert (
-        'git config --global url."git@github.com:NousResearch/hermes-agent.git".insteadOf '
-        '"https://github.com/NousResearch/hermes-agent.git"'
-    ) in text
+    assert "--setenv GIT_CONFIG_GLOBAL /work/gitconfig" in stage2
+    assert 'url."git@github.com:NousResearch/hermes-agent.git".insteadOf' in stage1
+
+
+def test_release_submodules_are_prefetched_outside_the_tls_proxy() -> None:
+    """Legacy top-level submodules must clone from sandbox-local mirrors."""
+    text = STAGE1.read_text(encoding="utf-8")
+
+    assert "protocol.file.allow always" in text
+    assert "submodule_mirror" in text
+    assert 'url."file:///work/repos/submodules/' in text
+    assert '"$submodule_commit:refs/heads/sandbox"' in text
+    assert "symbolic-ref HEAD refs/heads/sandbox" in text

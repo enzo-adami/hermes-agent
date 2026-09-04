@@ -216,6 +216,7 @@ exec bwrap \
   --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
   --setenv SSL_CERT_FILE /work/certs/ca.pem \
   --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
+  --setenv GIT_CONFIG_GLOBAL /work/gitconfig \
   --setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem \
   --setenv OPENSSL_CONF /work/certs/openssl.cnf \
   --setenv HTTP_PROXY http://127.0.0.1:8080 \
@@ -247,10 +248,5 @@ exec bwrap \
       cat /work/logs/proxy.log >&2 || true
       exit 1
     fi
-    # Older installers fall back from SSH to this canonical HTTPS URL. Keep
-    # that fallback on the sandbox-local fake main as well: reaching the real
-    # GitHub repository here both reintroduces external TLS flakiness and can
-    # install a tree different from the update target prepared by stage 1.
-    git config --global url."git@github.com:NousResearch/hermes-agent.git".insteadOf "https://github.com/NousResearch/hermes-agent.git"
     "$@"
   ' sandbox-command "$@"
