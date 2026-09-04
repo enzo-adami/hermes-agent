@@ -95,3 +95,11 @@ def test_node_dependency_failure_keeps_npm_diagnostics() -> None:
 
     assert 'npm install --silent \\\n                >"$npm_log"' not in text
     assert 'npm install \\\n                >"$npm_log"' in text
+
+
+def test_sandbox_does_not_force_host_node_headers_on_managed_node() -> None:
+    """A user install must let node-gyp resolve headers for its managed Node."""
+    stage1 = STAGE1.read_text(encoding="utf-8")
+
+    assert 'NODE_DIR="${DEV_SANDBOX_NODE_DIR:-}"' in stage1
+    assert 'NODE_DIR="$(dirname "$(dirname "$(command -v node)")")"' not in stage1
