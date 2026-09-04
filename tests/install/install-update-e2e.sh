@@ -294,6 +294,65 @@ else
   echo "⚠ could not prefetch uv installer; install will fetch astral.sh directly" >&2
 fi
 
+# uv's managed-Python download is large enough that an otherwise successful
+# request can end at the sandbox MITM boundary without TLS close_notify. Resolve
+# the current Linux x86_64 CPython 3.11 asset outside the sandbox, download it
+# with bounded retries, and place it at the exact decoded GitHub path the proxy
+# maps to a fixture. Unlike the small uv bootstrap fallback above, this artifact
+# is required: proceeding without it merely turns a clear preflight failure into
+# a later, misleading installer failure.
+if [ -n "$UV_INSTALLER_FIXTURE" ]; then
+  PYTHON_RELEASE_JSON="$LOG_DIR/python-build-standalone-release.json"
+  PYTHON_API_HEADERS=(-H 'Accept: application/vnd.github+json')
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    PYTHON_API_HEADERS+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  elif [ -n "${GH_TOKEN:-}" ]; then
+    PYTHON_API_HEADERS+=(-H "Authorization: Bearer $GH_TOKEN")
+  fi
+  curl -fsSL --retry 3 --retry-delay 2 \
+    "${PYTHON_API_HEADERS[@]}" \
+    https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest \
+    -o "$PYTHON_RELEASE_JSON" \
+    || fail "could not resolve the latest python-build-standalone release"
+
+  PYTHON_ASSET="$(python3 - "$PYTHON_RELEASE_JSON" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    release = json.load(handle)
+pattern = re.compile(
+    r"^cpython-3\.11\.\d+\+\d+-x86_64-unknown-linux-gnu-"
+    r"install_only_stripped\.tar\.gz$"
+)
+for asset in release.get("assets", []):
+    name = asset.get("name", "")
+    if pattern.fullmatch(name):
+        print(release["tag_name"], name, asset["browser_download_url"], sep="\t")
+        break
+else:
+    raise SystemExit("no Linux x86_64 CPython 3.11 asset in latest release")
+PY
+  )" || fail "could not select the managed Python fixture asset"
+  IFS=$'\t' read -r PYTHON_RELEASE PYTHON_ASSET_NAME PYTHON_ASSET_URL \
+    <<< "$PYTHON_ASSET"
+  PYTHON_FIXTURE="$UV_FIXTURE_DIR/github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_RELEASE/$PYTHON_ASSET_NAME"
+  mkdir -p "$(dirname "$PYTHON_FIXTURE")"
+  python_fixture_ready=false
+  for _attempt in 1 2 3 4 5; do
+    if curl -fsSL --retry 3 --retry-delay 2 "$PYTHON_ASSET_URL" \
+        -o "$PYTHON_FIXTURE" 2>/dev/null && [ -s "$PYTHON_FIXTURE" ]; then
+      python_fixture_ready=true
+      break
+    fi
+    sleep 3
+  done
+  [ "$python_fixture_ready" = true ] \
+    || fail "could not prefetch managed Python fixture after bounded retries"
+  ok "prefetched managed Python fixture $PYTHON_ASSET_NAME"
+fi
+
 step "installing upstream $INSTALL_REF (real curl | install.sh: uv, Python, Node, venv)"
 install_in_sandbox "install of upstream $INSTALL_REF" "$INSTALL_REF" install
 

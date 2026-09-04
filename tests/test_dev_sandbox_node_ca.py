@@ -6,6 +6,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STAGE1 = REPO_ROOT / "scripts" / "dev-sandbox.sh"
 STAGE2 = REPO_ROOT / "scripts" / "sandbox" / "stage2-run.sh"
+INSTALL_E2E = REPO_ROOT / "tests" / "install" / "install-update-e2e.sh"
 
 
 def test_node_trusts_the_proxy_ca_for_https_requests() -> None:
@@ -48,3 +49,12 @@ def test_release_submodules_are_prefetched_outside_the_tls_proxy() -> None:
     assert "symbolic-ref HEAD refs/heads/sandbox" in text
     assert 'submodule_keys="$(git config' in text
     assert "done < <(git config" not in text
+
+
+def test_managed_python_tarball_is_prefetched_for_the_sandbox() -> None:
+    """uv's managed Python download must not cross the flaky TLS proxy."""
+    text = INSTALL_E2E.read_text(encoding="utf-8")
+
+    assert "astral-sh/python-build-standalone/releases/latest" in text
+    assert "install_only_stripped" in text
+    assert 'github.com/astral-sh/python-build-standalone' in text
