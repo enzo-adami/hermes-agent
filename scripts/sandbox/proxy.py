@@ -124,15 +124,39 @@ def cert_for(host):
 
 
 def file_for(host, target):
-    """Resolve a request to a fixture file, or None to forward upstream."""
+    """Resolve a request to a contained fixture file, or None to forward."""
+    if host in {'.', '..'} or '/' in host or '\\' in host:
+        return None
+
     path = urlsplit(target).path or '/'
     parts = pathlib.PurePosixPath(unquote(path)).parts
     if '..' in parts:
         return None
-    candidate = ROOT / host / pathlib.PurePosixPath(*[p for p in parts if p != '/'])
-    if candidate.is_dir():
-        candidate /= 'index.html'
-    return candidate if candidate.is_file() else None
+
+    host_path = ROOT / host
+    # A fixture host is a real directory, never an alias to another host or an
+    # external tree. Resolve the requested file before returning it so direct
+    # and intermediate symlinks cannot escape the per-host boundary.
+    if host_path.is_symlink():
+        return None
+    try:
+        fixture_root = ROOT.resolve(strict=True)
+        host_root = host_path.resolve(strict=True)
+    except OSError:
+        return None
+    if host_root == fixture_root or not host_root.is_relative_to(fixture_root):
+        return None
+
+    candidate = host_root / pathlib.PurePosixPath(*[p for p in parts if p != '/'])
+    try:
+        resolved = candidate.resolve(strict=True)
+        if resolved.is_dir():
+            resolved = (resolved / 'index.html').resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved.is_relative_to(host_root) or not resolved.is_file():
+        return None
+    return resolved
 
 
 def respond_fixture(conn, found):

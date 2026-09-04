@@ -338,6 +338,51 @@ def test_connect_reports_upstream_connection_failure(monkeypatch, tmp_path) -> N
     assert bytes(client.sent).startswith(b"HTTP/1.1 502 Bad Gateway")
 
 
+def test_fixture_lookup_rejects_direct_and_intermediate_symlink_escape(
+    monkeypatch, tmp_path
+) -> None:
+    """Fixture paths must remain below the canonical per-host directory."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    host_root = proxy.ROOT / "example.com"
+    host_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    (host_root / "direct.txt").symlink_to(outside / "secret.txt")
+    (host_root / "nested").symlink_to(outside, target_is_directory=True)
+
+    assert proxy.file_for("example.com", "/direct.txt") is None
+    assert proxy.file_for("example.com", "/nested/secret.txt") is None
+
+
+def test_fixture_lookup_rejects_host_path_and_host_symlink_escape(
+    monkeypatch, tmp_path
+) -> None:
+    """An untrusted Host cannot select or alias a directory outside fixture ROOT."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    outside = proxy.ROOT.parent / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    (proxy.ROOT / "alias.example").symlink_to(outside, target_is_directory=True)
+
+    assert proxy.file_for("../outside", "/secret.txt") is None
+    assert proxy.file_for("alias.example", "/secret.txt") is None
+
+
+def test_fixture_lookup_preserves_contained_files_and_indexes(monkeypatch, tmp_path) -> None:
+    """Containment checks keep normal files, directories, and safe aliases working."""
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    host_root = proxy.ROOT / "example.com"
+    nested = host_root / "nested"
+    nested.mkdir(parents=True)
+    payload = nested / "index.html"
+    payload.write_text("fixture", encoding="utf-8")
+    (host_root / "alias.html").symlink_to(payload)
+
+    assert proxy.file_for("example.com", "/nested") == payload.resolve()
+    assert proxy.file_for("example.com", "/alias.html") == payload.resolve()
+
+
 def test_non_fixture_connect_relays_real_full_duplex_bytes(monkeypatch, tmp_path) -> None:
     """Transparent CONNECT preserves large payloads and propagates half-closes."""
     proxy = _load_proxy(monkeypatch, tmp_path)
