@@ -19,6 +19,7 @@ Usage: proxy.py <fixture-root> <certs-dir> <real-ca-bundle>
 
 import os
 import pathlib
+import select
 import socket
 import ssl
 import subprocess
@@ -187,12 +188,21 @@ def forward_https(conn, host, port, request):
                 return
             time.sleep(1)
 
+    stop = threading.Event()
+
     def c2u():
         # Client requests: forward verbatim (minus hop-by-hop headers).
         # `request` is the first one, already read by handle_connect.
         try:
             upstream.sendall(strip_proxy_headers(request))
-            while True:
+            while not stop.is_set():
+                # Avoid a permanently blocked recv when the upstream peer has
+                # finished its response. The relay thread must be quiescent
+                # before the main thread performs the TLS shutdown handshake.
+                if not conn.pending():
+                    readable, _, _ = select.select([conn], [], [], 0.25)
+                    if not readable:
+                        continue
                 req = read_request(conn)
                 if not req:
                     break
@@ -216,11 +226,20 @@ def forward_https(conn, host, port, request):
     except OSError:
         pass
     finally:
+        stop.set()
+        t.join(timeout=1)
+        # A raw socket.shutdown() tears down the TCP write side without a TLS
+        # close_notify. Git linked against GnuTLS rejects that as error -110
+        # even after a complete HTTP response. unwrap() performs the orderly
+        # TLS shutdown handshake before the transport is closed.
+        raw_conn = None
         try:
-            conn.shutdown(socket.SHUT_WR)
-        except OSError:
+            conn.settimeout(5)
+            raw_conn = conn.unwrap()
+        except (OSError, ssl.SSLError):
             pass
-        t.join(timeout=5)
+        if raw_conn is not None:
+            raw_conn.close()
         upstream.close()
 
 
