@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 import yaml
@@ -26,7 +27,8 @@ if not hasattr(_mcp_server_mod, "MCPServer"):
     )
 
 
-def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
+@pytest.mark.parametrize("startup_delay", [0, 3])
+def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path, startup_delay):
     profile_home = tmp_path / "profile-home"
     profile_home.mkdir()
     marker = "profile-local-61922"
@@ -43,6 +45,8 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
                 return {marker!r}
 
             if __name__ == "__main__":
+                import time
+                time.sleep({startup_delay})
                 mcp.run(transport="stdio")
             """
         ),
@@ -92,19 +96,36 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         assert proc.stdin is not None
         assert proc.stdout is not None
         stdout = proc.stdout
+
+        def read_responses():
+            for line in stdout:
+                output.put(line)
+
         threading.Thread(
-            target=lambda: output.put(stdout.readline()),
+            target=read_responses,
             daemon=True,
         ).start()
-        proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
-        proc.stdin.flush()
-        try:
-            line = output.get(timeout=10)
-        except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
-        response = json.loads(line)
-        assert response["ok"] is True
-        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+        # Startup deliberately bounds discovery; a healthy slow server can
+        # register after the first /tools snapshot. Observe readiness within
+        # the existing overall deadline instead of requiring that first race.
+        deadline = time.monotonic() + 10
+        request_id = 0
+        while time.monotonic() < deadline:
+            request_id += 1
+            proc.stdin.write(json.dumps({"id": request_id, "command": "/tools"}) + "\n")
+            proc.stdin.flush()
+            try:
+                line = output.get(timeout=max(0, deadline - time.monotonic()))
+            except queue.Empty:
+                pytest.fail("slash worker produced no /tools response within 10 seconds")
+            response = json.loads(line)
+            assert response["id"] == request_id
+            assert response["ok"] is True
+            if "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("profile-local MCP tool was not discovered within 10 seconds")
     finally:
         proc.terminate()
         try:
