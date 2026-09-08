@@ -10,6 +10,9 @@ import signal
 import subprocess
 import sys
 import threading
+import time
+
+import pytest
 
 
 
@@ -444,8 +447,9 @@ class TestDelegationCleanup:
         assert result["status"] == "error"
         relay_host.unregister_subagent.assert_not_called()
 
+    @pytest.mark.parametrize("startup_delay", [0, 0.3])
     def test_timed_out_child_keeps_relay_session_until_its_turn_exits(
-        self, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path, startup_delay
     ):
         from unittest.mock import MagicMock
 
@@ -473,6 +477,31 @@ class TestDelegationCleanup:
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
         monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+
+        from tools import daemon_pool, delegate_tool
+
+        original_initializer = delegate_tool._set_subagent_approval_cb
+
+        def delayed_initializer(*args):
+            time.sleep(startup_delay)
+            original_initializer(*args)
+
+        monkeypatch.setattr(delegate_tool, "_set_subagent_approval_cb", delayed_initializer)
+
+        class ActiveTurnExecutor(daemon_pool.DaemonThreadPoolExecutor):
+            def __init__(self, *args, **kwargs):
+                self.wait_for_turn = kwargs.get("initializer") is delayed_initializer
+                super().__init__(*args, **kwargs)
+
+            def submit(self, *args, **kwargs):
+                future = super().submit(*args, **kwargs)
+                # Only synchronize the child executor, not relay scope workers.
+                # Keep the real Future and its real active-turn timeout below.
+                if self.wait_for_turn:
+                    assert child_started.wait(timeout=5), "child turn did not start"
+                return future
+
+        monkeypatch.setattr(daemon_pool, "DaemonThreadPoolExecutor", ActiveTurnExecutor)
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
