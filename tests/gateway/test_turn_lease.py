@@ -20,6 +20,7 @@ Covers:
 """
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -171,8 +172,9 @@ async def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("routing_delay", [0, 1.2])
 async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, routing_delay
 ):
     """A lease rejection is not a completed turn for `/goal` evaluation.
 
@@ -182,6 +184,13 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
 
     runner = _bootstrap(monkeypatch, tmp_path)
+    original_recovery = runner._recover_telegram_topic_thread_id
+
+    def delayed_recovery(source):
+        time.sleep(routing_delay)
+        return original_recovery(source)
+
+    runner._recover_telegram_topic_thread_id = delayed_recovery
     runner._turn_leases = SessionTurnLeaseRegistry()
     holder = await runner._turn_leases.acquire(
         "sess-dedup", owner_key="holder-key", generation=1, timeout=1
@@ -199,9 +208,25 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._run_agent = pytest.fail
     runner._post_turn_goal_continuation = AsyncMock()
 
+    lease_started = asyncio.Event()
+    original_acquire = runner._turn_leases.acquire
+
+    async def observe_acquire(*args, **kwargs):
+        lease_started.set()
+        return await original_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(runner._turn_leases, "acquire", observe_acquire)
+    dispatch = asyncio.create_task(runner._handle_message(_event()))
     try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
+        # Routing and its executor startup are not the lease wait. Bound setup
+        # separately, then retain the short rejection deadline for the real
+        # contended acquire (well below the agent inactivity timeout of 5s).
+        await asyncio.wait_for(lease_started.wait(), timeout=5)
+        response = await asyncio.wait_for(dispatch, timeout=1)
     finally:
+        if not dispatch.done():
+            dispatch.cancel()
+        await asyncio.gather(dispatch, return_exceptions=True)
         assert runner._turn_leases.release(holder) is True
 
     assert isinstance(response, str)
