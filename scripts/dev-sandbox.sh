@@ -182,6 +182,8 @@ done
 
 GIT_ROOT="${HERMES_SANDBOX_SOURCE_ROOT:-$(git rev-parse --show-toplevel)}"
 GIT_ROOT="$(cd "$GIT_ROOT" && pwd)"
+# shellcheck source=scripts/sandbox/git-fetch-retry.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sandbox/git-fetch-retry.sh"
 if [ "$INSTALL_SHORTCUT" = true ] && [ -z "$INSTALL_REF" ] && [ -z "$INSTALLER_PATH" ]; then
   INSTALLER_PATH="$GIT_ROOT/scripts/install.sh"
 fi
@@ -232,9 +234,14 @@ if [ -n "$INSTALL_REF" ]; then
   # Peel to ^{commit} in both cases: an annotated tag fetches as a tag OBJECT,
   # and using it directly fails later with "trying to write non-commit object
   # ... to branch 'refs/heads/main'".
-  if git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" "$INSTALL_REF" 2>/dev/null; then
+  #
+  # Both fetches go through git_fetch_retry: GitHub rate-limits the E2E
+  # matrix's parallel anonymous fetches (HTTP 429), and one throttled reply
+  # must not read as "ref does not exist". The first attempt stays quiet on
+  # permanent failures because a raw SHA is expected to miss there.
+  if git_fetch_retry "$UPSTREAM_REPO" "$UPSTREAM_URL" "$INSTALL_REF" 2>/dev/null; then
     UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse "FETCH_HEAD^{commit}")"
-  elif git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" refs/heads/main \
+  elif git_fetch_retry "$UPSTREAM_REPO" "$UPSTREAM_URL" refs/heads/main \
     && UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse --verify -q "$INSTALL_REF^{commit}")"; then
     :
   else
