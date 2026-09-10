@@ -76,6 +76,8 @@ FAKE_REMOTE="/work/repos/hermes-agent.git"
 # its own fetching. Same override dev-sandbox.sh honours, so a fork can retarget
 # both together.
 UPSTREAM_URL="${HERMES_DEV_SANDBOX_UPSTREAM:-https://github.com/NousResearch/hermes-agent.git}"
+# shellcheck source=../../scripts/sandbox/git-fetch-retry.sh
+. "$REPO_ROOT/scripts/sandbox/git-fetch-retry.sh"
 
 # Installer transcripts live outside the sandbox root: the sandbox is recreated
 # and (unless --keep) deleted, and these logs are the most useful artifact when
@@ -167,13 +169,15 @@ update_supports() {
 #
 # The ref may not be local -- the sandbox does its own fetching -- so fall back
 # to fetching just that blob. Unresolvable means "flag absent", which costs a
-# more conservative invocation, never a wrong one.
+# more conservative invocation, never a wrong one -- which is exactly why the
+# fetch retries transient failures: a GitHub 429 on a ref that does exist
+# would otherwise silently drop a flag the release supports.
 installer_supports() {
   local ref="$1"
   local flag="$2"
   local script=""
   script="$(git show "$ref:scripts/install.sh" 2>/dev/null)" || {
-    git fetch -q --depth 1 "$UPSTREAM_URL" "$ref" 2>/dev/null || return 1
+    git_fetch_retry . --depth 1 "$UPSTREAM_URL" "$ref" 2>/dev/null || return 1
     script="$(git show FETCH_HEAD:scripts/install.sh 2>/dev/null)" || return 1
   }
   # Installers exceed pipe capacity; consume the whole script even on a match.
