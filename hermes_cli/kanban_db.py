@@ -3506,7 +3506,21 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
-    with write_txn(conn):
+    from hermes_cli.profile_lifecycle import (
+        assert_profile_assignment_available,
+        profile_lifecycle_lock,
+    )
+
+    # Reject nested writers before waiting on the lifecycle authority: callers
+    # must never hold the SQLite writer lock while acquiring this outer lock.
+    if conn.in_transaction:
+        raise RuntimeError("assign_task cannot run inside an open transaction")
+    assignment_guard = (
+        profile_lifecycle_lock() if profile is not None else contextlib.nullcontext()
+    )
+    with assignment_guard, write_txn(conn):
+        if profile is not None:
+            assert_profile_assignment_available(profile)
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -9650,7 +9664,13 @@ def _dispatch_once_locked(
                 # 'assigned' event so the board state matches what just happened.
                 if not dry_run:
                     try:
-                        with write_txn(conn):
+                        from hermes_cli.profile_lifecycle import (
+                            assert_profile_assignment_available,
+                            profile_lifecycle_lock,
+                        )
+
+                        with profile_lifecycle_lock(), write_txn(conn):
+                            assert_profile_assignment_available(_default_assignee)
                             conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                                 "AND (assignee IS NULL OR assignee = '')",
