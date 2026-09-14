@@ -89,6 +89,10 @@ jobs:
       # One release breaking is worth knowing about even if another already
       # failed, so let every leg report.
       fail-fast: false
+      # Every leg fetches the upstream repository anonymously from the same
+      # runner egress; ten at once is how GitHub starts answering 429. The
+      # fetch retries, but fewer concurrent legs keeps it from needing to.
+      max-parallel: 3
       matrix:
         install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
     uses: ./.github/workflows/install-e2e-run.yml

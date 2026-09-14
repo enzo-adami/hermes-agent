@@ -469,8 +469,11 @@ MODEL_ALIASES: dict[str, ModelIdentity] = {
     # Google
     "gemini":    ModelIdentity("google", "gemini"),
 
-    # DeepSeek
-    "deepseek":  ModelIdentity("deepseek", "deepseek-chat"),
+    # DeepSeek — the flagship V4 Pro.  ``deepseek-chat`` was retired on
+    # 2026-07-24 (see hermes_cli.model_normalize); a family prefix of
+    # ``deepseek`` alone would match Pro, Flash and Flash-Vision and always
+    # trip the ambiguity guard, so the alias names the tier explicitly.
+    "deepseek":  ModelIdentity("deepseek", "deepseek-v4-pro"),
 
     # X.AI
     "grok":      ModelIdentity("x-ai", "grok"),
