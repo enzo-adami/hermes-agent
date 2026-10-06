@@ -3730,6 +3730,9 @@ class BasePlatformAdapter(ABC):
                     or result.retry_after is not None
                     or self._is_retryable_error(error_str)
                 ):
+                    # A timeout mid-retry may have delivered: same rule as the first send, no plain re-send.
+                    if self._is_timeout_error(error_str):
+                        return result
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
                 # All retries exhausted (loop completed without break) — notify user.

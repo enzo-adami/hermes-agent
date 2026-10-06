@@ -288,3 +288,20 @@ class TestSendWithRetryFailureTypeTransitions:
         assert result.success  # fallback succeeded
         # No delivery-failure notice was sent (this is a formatting fallback, not network exhaustion)
         assert "delivery failed" not in adapter._send_calls[-1][1].lower()
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_retry_returns_failure_without_plain_resend(self):
+        """A retry that times out may have delivered, exactly like a first-send timeout:
+        it must return the failure, not fall through to the plain-text fallback (duplicate)."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="httpx.ConnectError: connection refused"),
+            SendResult(success=False, error="ReadTimeout: request timed out"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=3, base_delay=0)
+        assert not result.success
+        assert "timed out" in (result.error or "")
+        # 1 initial + 1 retry; no plain-text re-send of a possibly delivered payload.
+        assert len(adapter._send_calls) == 2
+        assert all("plain text" not in call[1].lower() for call in adapter._send_calls)
