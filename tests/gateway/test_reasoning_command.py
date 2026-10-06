@@ -91,6 +91,24 @@ class TestReasoningCommand:
 
 
     @pytest.mark.asyncio
+    async def test_reasoning_status_labels_effort_against_configured_route(self, tmp_path, monkeypatch):
+        """The status label clamps the effort on the configured route, not on an empty one:
+        openai-codex has no ``minimal`` wire level, so the reply must say what it really sends."""
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
+            "agent:\n  reasoning_effort: minimal\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        reply = await runner._handle_reasoning_command(_make_event("/reasoning"))
+
+        assert "minimal (sends low on this route)" in reply
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("effort", ["max", "ultra"])
     async def test_handle_reasoning_command_accepts_extended_efforts(
         self, tmp_path, monkeypatch, effort

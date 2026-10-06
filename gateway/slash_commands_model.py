@@ -764,7 +764,7 @@ class GatewayModelCommandsMixin:
         _session_route = ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {})
         _model_cfg = {}
         with contextlib.suppress(Exception):  # fail-open on config read errors, like /model does
-            _model_cfg = _load_gateway_config(config_path=self.config_path).get("model", {}) or {}
+            _model_cfg = _load_gateway_config().get("model", {}) or {}
         _route = (
             _session_route.get("provider") or _model_cfg.get("provider"),
             _session_model or _model_cfg.get("default") or _model_cfg.get("model"),
