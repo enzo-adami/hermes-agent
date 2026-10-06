@@ -55,6 +55,8 @@ def stored_session_route(session_meta, *, current_model, current_provider):
     if not stored_model:
         return None
     from hermes_state import SessionDB as _SessionDB
+    if _SessionDB.session_route_is_fallback(session_meta):
+        return None  # the last turn's automatic fallback is not the session's route
     runtime = _SessionDB.session_gateway_runtime(session_meta)
     base_url = runtime.get("base_url") or None
     provider = _heal_bare_custom_provider(runtime.get("provider") or None, base_url=base_url, model=stored_model)

@@ -1677,7 +1677,12 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # Canonical route reader shared with CLI --resume: nested ``gateway_runtime`` (the route the messaging
     # gateway last ran) before the TUI's top-level keys, then a routable ``billing_provider`` (#125942).
     from hermes_state import SessionDB
-    route = SessionDB.session_gateway_runtime(row)
+    if SessionDB.session_route_is_fallback(row):
+        # The last turn's automatic fallback (model column included) is not the session's route: rebuild
+        # model and provider from the current config, as the agent itself does at every new turn (#110279).
+        model, route = "", {}
+    else:
+        route = SessionDB.session_gateway_runtime(row)
     provider, base_url, api_mode = (str(route.get(k) or "").strip() for k in ("provider", "base_url", "api_mode"))
     service_tier = str(model_config.get("service_tier") or "").strip()
     reasoning_config = model_config.get("reasoning_config")

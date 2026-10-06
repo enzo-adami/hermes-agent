@@ -54,3 +54,28 @@ def test_resume_prefers_gateway_runtime_over_stale_top_level_keys():
         {"provider": "anthropic", **NOUS_ROUTE, "gateway_runtime": {"provider": "openai-codex", "api_mode": "codex_responses"}})}
     desktop = _stored_session_runtime_overrides(row)["model_override"]
     assert (desktop["provider"], desktop["base_url"], desktop["api_mode"]) == ("openai-codex", None, "codex_responses")
+
+
+FALLBACK_ROW = {"model": "gpt-5.6-sol", "model_config": json.dumps({
+    "model": "glm-5.3", "provider": "zai", "reasoning_config": {"enabled": True, "effort": "high"},
+    "gateway_runtime": {"provider": "openai-codex", "api_mode": "codex_responses", "fallback_active": True}})}
+
+
+def test_resume_after_automatic_fallback_rebuilds_from_configured_primary():
+    """The row of #110279: the gateway's last turn ran on an automatic fallback, so ``sessions.model``
+    holds the fallback model. Resume must neither pair it with the primary provider (Desktop) nor pin the
+    session to the fallback route (CLI): the agent restores its primary at every turn, so do both readers."""
+    desktop = _stored_session_runtime_overrides(FALLBACK_ROW)
+    assert "model_override" not in desktop and "provider_override" not in desktop
+    assert desktop["reasoning_config_override"] == {"enabled": True, "effort": "high"}  # non-route state kept
+    assert stored_session_route(FALLBACK_ROW, current_model="glm-5.3", current_provider="zai") is None
+
+
+def test_resume_after_restored_primary_keeps_the_stored_route():
+    """``fallback_active: false`` (primary restored on the last turn) is an ordinary stored route."""
+    row = {"model": "gpt-5.6-sol", "model_config": json.dumps(
+        {"gateway_runtime": {"provider": "openai-codex", "api_mode": "codex_responses", "fallback_active": False}})}
+    assert SessionDB.session_route_is_fallback(row) is False
+    assert _stored_session_runtime_overrides(row)["model_override"]["provider"] == "openai-codex"
+    assert stored_session_route(row, current_model="glm-5.3", current_provider="zai")[:2] == (
+        "gpt-5.6-sol", "openai-codex")

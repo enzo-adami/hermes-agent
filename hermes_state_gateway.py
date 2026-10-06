@@ -803,6 +803,21 @@ class SessionGatewayMixin:
         return counts
 
     @staticmethod
+    def session_route_is_fallback(session_meta: Optional[dict[str, Any]]) -> bool:
+        """True when the row's last gateway turn ran on an automatic provider fallback
+        (``model_config.gateway_runtime.fallback_active``). The agent restores its primary
+        at every new turn, so that route (and the fallback model in ``sessions.model``)
+        describes one turn, not the session: resume must rebuild from the configured primary."""
+        raw = (session_meta or {}).get("model_config")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return False
+        runtime = raw.get("gateway_runtime") if isinstance(raw, dict) else None
+        return isinstance(runtime, dict) and runtime.get("fallback_active") is True
+
+    @staticmethod
     def session_gateway_runtime(session_meta: Optional[dict[str, Any]]) -> dict[str, Any]:
         """Read the persisted runtime route off a session row dict (``model_config`` as
         JSON string or parsed dict). Precedence: nested ``gateway_runtime`` (gateway sync /
