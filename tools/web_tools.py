@@ -133,7 +133,8 @@ def _autodetect_backend() -> Optional[str]:
 
     # Plugin-contributed providers (built-ins are covered above); probe the held object directly.
     for provider in _list_registered_web_providers():
-        if provider.name not in _LEGACY_WEB_BACKENDS and _probe(provider, "is_available"):
+        if (provider.name not in _LEGACY_WEB_BACKENDS
+                and _probe(provider, "supports_search") and _probe(provider, "is_available")):
             return provider.name
     return None
 
