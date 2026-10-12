@@ -194,9 +194,12 @@ class TestCheckWebApiKey:
         )
         assert web_tools.check_web_api_key() is True
 
-    def test_no_credentials_fails(self, monkeypatch):
+    @pytest.mark.parametrize("local_available", [False, True])
+    def test_no_credentials_requires_an_available_keyless_provider(self, monkeypatch, local_available):
         from tools import web_tools
         from agent import web_search_registry
+        from plugins.web.local.provider import LocalWebSearchProvider
+        monkeypatch.setattr(LocalWebSearchProvider, "is_available", lambda self: local_available)
         monkeypatch.setattr(web_tools, "_load_web_config", dict)
         monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
         monkeypatch.delenv("FIRECRAWL_API_URL", raising=False)
@@ -210,7 +213,7 @@ class TestCheckWebApiKey:
         # Disable the keyless free tier — with it on, zero credentials still
         # resolves (Parallel/Exa anonymous MCP; see test_web_keyless_fallback.py).
         monkeypatch.setattr(web_search_registry, "_keyless_tier_enabled", lambda: False)
-        assert web_tools.check_web_api_key() is False
+        assert web_tools.check_web_api_key() is local_available
 
 
 # ---------------------------------------------------------------------------
