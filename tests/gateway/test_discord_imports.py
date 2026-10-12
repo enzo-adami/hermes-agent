@@ -56,11 +56,11 @@ class TestDiscordImportSafety:
                 except AttributeError:
                     pass
             else:
-                setattr(platforms_package, "discord", old_discord_attr)
+                platforms_package.discord = old_discord_attr
                 if old_adapter_attr is missing:
                     try:
                         delattr(old_discord_attr, "adapter")
                     except AttributeError:
                         pass
                 else:
-                    setattr(old_discord_attr, "adapter", old_adapter_attr)
+                    old_discord_attr.adapter = old_adapter_attr
