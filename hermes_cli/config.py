@@ -179,6 +179,8 @@ _LAST_EXPANDED_CONFIG_BY_PATH: dict[str, Any] = {}
 _LOAD_CONFIG_CACHE: dict[str, tuple[int, ...]] = {}
 # path -> (mtime_ns, size, ino, ctime_ns, raw yaml dict) for read_raw_config() (no defaults merged in).
 _RAW_CONFIG_CACHE: dict[str, tuple[int, ...]] = {}
+_CONFIG_INCLUDE_KEYS = ("include", "includes")
+_CONFIG_INCLUDE_SIGNATURES: dict[str, tuple[tuple[Any, ...], ...]] = {}
 
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS (managed by setup/provider
 # flows directly). Also the set reload_env() may remove from os.environ.
@@ -1489,6 +1491,114 @@ def _merge_partial_save(raw: dict, override: dict) -> dict:
     return result
 
 
+def _without_config_include_keys(config: dict[str, Any]) -> dict[str, Any]:
+    return {k: copy.deepcopy(v) for k, v in config.items() if k not in _CONFIG_INCLUDE_KEYS}
+
+
+def _iter_config_include_values(config: dict[str, Any]) -> list[Any]:
+    values: list[Any] = []
+    for key in _CONFIG_INCLUDE_KEYS:
+        raw = config.get(key)
+        if raw is not None:
+            values.extend(raw if isinstance(raw, list) else [raw])
+    return values
+
+
+def _resolve_config_include_path(config_path: Path, raw: Any) -> Optional[Path]:
+    if not isinstance(raw, str) or not raw.strip():
+        logger.warning("Ignoring non-string config include entry in %s", config_path)
+        return None
+    path = Path(os.path.expandvars(os.path.expanduser(raw.strip())))
+    if not path.is_absolute():
+        path = config_path.parent / path
+    return path.resolve()
+
+
+def _read_config_yaml(path: Path) -> dict[str, Any]:
+    with open(path, encoding="utf-8-sig") as f:
+        data = fast_safe_load(f) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _merge_config_includes(
+    config_path: Path, config: dict[str, Any], *, seen: Optional[set[Path]] = None,
+) -> tuple[dict[str, Any], tuple[tuple[Any, ...], ...]]:
+    """Merge relative includes in order, with the declaring file taking precedence."""
+    seen = set(seen or ()) | {config_path.resolve()}
+    merged: dict[str, Any] = {}
+    signatures: list[tuple[Any, ...]] = []
+    for raw_include in _iter_config_include_values(config):
+        include_path = _resolve_config_include_path(config_path, raw_include)
+        if include_path is None:
+            continue
+        if include_path in seen:
+            logger.warning("Skipping recursive config include %s from %s", include_path, config_path)
+            continue
+        try:
+            st = include_path.stat()
+        except FileNotFoundError:
+            logger.warning("Config include %s referenced by %s does not exist", include_path, config_path)
+            signatures.append((str(config_path), raw_include, str(include_path), -1, -1, -1, -1))
+            continue
+        signatures.append((str(config_path), raw_include, str(include_path), *file_signature(st)))
+        try:
+            include_config = _read_config_yaml(include_path)
+        except Exception as e:
+            raise ValueError(f"Invalid config include {include_path}") from e
+        include_merged, include_sig = _merge_config_includes(include_path, include_config, seen=seen)
+        signatures.extend(include_sig)
+        merged = _deep_merge(merged, include_merged)
+    return _deep_merge(merged, _without_config_include_keys(config)), tuple(signatures)
+
+
+def _strip_included_config_values(
+    config: dict[str, Any], included: dict[str, Any], *,
+    preserve_keys: Optional[set[tuple[str, ...]]] = None,
+) -> dict[str, Any]:
+    """Keep explicit overrides; do not materialize unchanged included values."""
+    preserve_keys = set(preserve_keys or ())
+    omitted = object()
+
+    def strip(value: Any, baseline: Any, path: tuple[str, ...]) -> Any:
+        if path in preserve_keys:
+            return copy.deepcopy(value)
+        if isinstance(value, dict):
+            baseline_dict = baseline if isinstance(baseline, dict) else {}
+            out = {}
+            for key, child in value.items():
+                stripped = strip(child, baseline_dict.get(key, omitted), path + (key,))
+                if stripped is not omitted:
+                    out[key] = stripped
+            return out if out else omitted
+        return omitted if baseline is not omitted and value == baseline else copy.deepcopy(value)
+
+    result = {}
+    for key, value in config.items():
+        stripped = strip(value, included.get(key, omitted), (key,))
+        if stripped is not omitted:
+            result[key] = stripped
+    return result
+
+
+def _config_includes_unchanged(path_key: str, signatures=None) -> bool:
+    """Stat dependencies without reparsing YAML; each reader owns its snapshot."""
+    if signatures is None:
+        signatures = _CONFIG_INCLUDE_SIGNATURES.get(path_key, ())
+    for parent, raw, previous_path, *previous_signature in signatures:
+        path = _resolve_config_include_path(Path(parent), raw)
+        if path is None or str(path) != previous_path:
+            return False
+        try:
+            signature = file_signature(path.stat())
+        except FileNotFoundError:
+            signature = (-1, -1, -1, -1)
+        except OSError:
+            return False
+        if signature != tuple(previous_signature):
+            return False
+    return True
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base*: dict-over-dict recurses (so overriding one leaf
     keeps sibling defaults), and ``None`` over a dict section is ignored.
@@ -2290,6 +2400,8 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[dict[str, 
     cached = _LOAD_CONFIG_CACHE.get(path_key)
     if cached is None or cache_sig is None or cached[:8] != cache_sig:
         return None
+    if not _config_includes_unchanged(path_key):
+        return None
     hit = cached[8]
     if isinstance(hit, FailedConfigRead) and isinstance(hit.read_error, OSError):
         # A read error (EMFILE/EIO/sharing violation) can clear without touching the file's
@@ -2342,6 +2454,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                 with open(config_path, encoding="utf-8-sig") as f:
                     user_config = fast_safe_load(f) or {}
                 _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
+                user_config, include_sig = _merge_config_includes(config_path, user_config)
+                _CONFIG_INCLUDE_SIGNATURES[path_key] = include_sig
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -2480,6 +2594,8 @@ def save_config(
         if merge_existing and _raw_for_paths:
             config = _merge_partial_save(_raw_for_paths, config)
 
+        include_declarations = {key: _raw_for_paths[key] for key in _CONFIG_INCLUDE_KEYS if key in _raw_for_paths}
+        included_config, _ = _merge_config_includes(config_path, include_declarations)
         current_normalized = _canonicalize_config(config)
         normalized = current_normalized
         if _raw_for_paths:
@@ -2487,9 +2603,13 @@ def save_config(
                 normalized, _canonicalize_config(_raw_for_paths),
                 _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))
 
+        effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
+        if included_config:
+            normalized = _strip_included_config_values(
+                normalized, _canonicalize_config(included_config), preserve_keys=effective_preserve_keys)
+        normalized.update(copy.deepcopy(include_declarations))
         if strip_defaults:
             # ``_strip_default_values`` always preserves ``_config_version`` itself.
-            effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
             normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
 
         atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))

@@ -28,6 +28,8 @@ from utils import fast_safe_load
 _LAST_GOOD_USER_RAW: dict[str, dict[str, Any]] = {}
 # path -> (*user_signature, *managed_signature, effective, env_snapshot); see utils.file_signature.
 _EFFECTIVE_CACHE: dict[str, tuple[Any, ...]] = {}
+_INCLUDE_SIGNATURES: dict[str, tuple[tuple[Any, ...], ...]] = {}
+_LAST_GOOD_INCLUDED: dict[str, dict[str, Any]] = {}
 
 
 def _effective(raw: dict[str, Any]) -> dict[str, Any]:
@@ -67,7 +69,8 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         user_sig, cache_sig = _config._load_config_cache_sig(config_path)
         cached = _EFFECTIVE_CACHE.get(path_key)
         if cached is not None and cache_sig is not None and cached[:8] == cache_sig:
-            if all(_config._env_ref_lookup(k) == v for k, v in cached[9].items()):
+            if (_config._config_includes_unchanged(path_key, _INCLUDE_SIGNATURES.get(path_key, ()))
+                    and all(_config._env_ref_lookup(k) == v for k, v in cached[9].items())):
                 return copy.deepcopy(cached[8])
 
         raw: dict[str, Any] = {}
@@ -95,6 +98,17 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                     from hermes_cli.config_backups import backup_config
                     backup_config(config_path, "good")
 
+        try:
+            raw, include_sig = _config._merge_config_includes(config_path, raw)
+        except Exception as exc:
+            if fail_closed:
+                raise
+            _warn_config_parse_failure(config_path, exc, fallback="last-known-good")
+            raw, recovered = copy.deepcopy(_LAST_GOOD_INCLUDED.get(path_key, {})), True
+        else:
+            _INCLUDE_SIGNATURES[path_key] = include_sig
+            if not recovered:
+                _LAST_GOOD_INCLUDED[path_key] = copy.deepcopy(raw)
         env_snapshot = _config._env_ref_snapshot(raw)
         managed = managed_scope.load_managed_config()
         if managed:
