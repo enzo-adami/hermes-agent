@@ -14,10 +14,12 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
 
 import pytest
 
 from tests.hermes_cli.test_update_pause_record import _child, _reap_children
+from tests.waiting import wait_until
 
 _UNIT = {"kind": "systemd", "scope": "user", "unit": "hermes-gateway-p2probe.service", "pid": 4242}
 
@@ -215,5 +217,38 @@ def test_a_launchd_job_is_paused_through_launchd_and_restarted_through_it(tmp_pa
         assert not _alive(first, None) and not pid(), "the paused job is running again under launchd"
         _start_job(job)
         assert pid() and pid() != first, "the restart did not bring the job back under launchd"
+    finally:
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, check=False)
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.live_system_guard_bypass
+def test_resuming_a_launchd_job_that_still_runs_leaves_it_running(tmp_path):
+    """An update interrupted while a launchd gateway still drains its turns (^C, a failed pause)
+    resumes the set at exit with that job loaded and running: its bootstrap answers EIO 5, and
+    booting it out as a stale registration SIGTERMed the gateway mid-turn (#138612). The same
+    process must keep running, and the set keep it owed until it has exited."""
+    from hermes_cli.gateway import _launchd_print_service_pid
+    from hermes_cli.update_cmd_posix_pause import resume_paused_set
+    label = f"ai.hermes.p2probe-{os.getpid()}"
+    plist = tmp_path / f"{label}.plist"
+    plist.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": ["/bin/sleep", "600"],
+                                      "RunAtLoad": True, "KeepAlive": True}))
+    domain = f"gui/{os.getuid()}"  # windows-footgun: ok — macOS-only test (platforms("macos"))
+    if subprocess.run(["launchctl", "print", domain], capture_output=True, check=False).returncode:
+        domain = f"user/{os.getuid()}"  # windows-footgun: ok — macOS-only test (platforms("macos"))
+
+    def pid() -> int | None:
+        return _launchd_print_service_pid(domain, label)[1]
+
+    subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=30)
+    try:
+        first = wait_until(pid, timeout=15, what="launchd to start the probe job")
+        token = {"platform": "posix", "resume_needed": True, "posix_stopped": True, "posix_units": [
+            {"kind": "launchd", "label": label, "domain": domain, "plist": str(plist), "pid": first}]}
+        with suppress(RuntimeError):  # owed: it cannot come back before it has exited
+            resume_paused_set(token)
+        assert pid() == first, "the resume stopped a launchd job that was still running (its turns cut)"
+        assert token["posix_units"] and token["resume_needed"], f"its restart debt was dropped: {token}"
     finally:
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, check=False)
