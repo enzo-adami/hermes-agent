@@ -14,7 +14,6 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import suppress
 
 import pytest
 
@@ -227,10 +226,10 @@ def test_resuming_a_launchd_job_that_still_runs_leaves_it_running(tmp_path):
     """An update interrupted while a launchd gateway still drains its turns (^C, a failed pause)
     resumes the set at exit with that job loaded and running: its bootstrap answers EIO 5, and
     booting it out as a stale registration SIGTERMed the gateway mid-turn (#138612). The same
-    process must keep running, and the set keep it owed until it has exited."""
+    process must keep running, the set keep it owed until it has exited, and the resume say so."""
     from hermes_cli.gateway import _launchd_print_service_pid
     from hermes_cli.update_cmd_posix_pause import resume_paused_set
-    label = f"ai.hermes.p2probe-{os.getpid()}"
+    label = f"ai.hermes.p2probe-resume-{os.getpid()}"
     plist = tmp_path / f"{label}.plist"
     plist.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": ["/bin/sleep", "600"],
                                       "RunAtLoad": True, "KeepAlive": True}))
@@ -246,7 +245,7 @@ def test_resuming_a_launchd_job_that_still_runs_leaves_it_running(tmp_path):
         first = wait_until(pid, timeout=15, what="launchd to start the probe job")
         token = {"platform": "posix", "resume_needed": True, "posix_stopped": True, "posix_units": [
             {"kind": "launchd", "label": label, "domain": domain, "plist": str(plist), "pid": first}]}
-        with suppress(RuntimeError):  # owed: it cannot come back before it has exited
+        with pytest.raises(RuntimeError, match="still runs its paused gateway"):  # owed until it has exited
             resume_paused_set(token)
         assert pid() == first, "the resume stopped a launchd job that was still running (its turns cut)"
         assert token["posix_units"] and token["resume_needed"], f"its restart debt was dropped: {token}"

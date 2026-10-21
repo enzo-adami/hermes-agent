@@ -2581,8 +2581,7 @@ class TestLaunchctlBootstrapEioRetry:
         def fake_run(cmd, check=True, **kwargs):
             calls.append(cmd)
             bootstrap_calls = [c for c in calls if c[1] == "bootstrap"]
-            # First bootstrap hits EIO; print shows the label loaded with no PID (stale), so the
-            # bootout clears it and the retry succeeds.
+            # First bootstrap hits EIO; bootout clears it; retry succeeds.
             if cmd[1] == "bootstrap" and len(bootstrap_calls) == 1:
                 raise subprocess.CalledProcessError(5, cmd)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -2591,8 +2590,11 @@ class TestLaunchctlBootstrapEioRetry:
 
         gateway_cli._launchctl_bootstrap(self.DOMAIN, self.PLIST, self.LABEL)
 
-        bootstrap, target = ["launchctl", "bootstrap", self.DOMAIN, self.PLIST], f"{self.DOMAIN}/{self.LABEL}"
-        assert calls == [bootstrap, ["launchctl", "print", target], ["launchctl", "bootout", target], bootstrap]
+        assert calls == [
+            ["launchctl", "bootstrap", self.DOMAIN, self.PLIST],
+            ["launchctl", "bootout", f"{self.DOMAIN}/{self.LABEL}"],
+            ["launchctl", "bootstrap", self.DOMAIN, self.PLIST],
+        ]
 
     def test_persistent_eio_reraises_for_domain_fallback(self, monkeypatch):
         # When the retry also fails, the error must propagate so callers apply

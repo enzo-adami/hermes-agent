@@ -94,17 +94,32 @@ def _launchctl_domain_unsupported(returncode: int) -> bool:
     return returncode in _LAUNCHCTL_DOMAIN_UNSUPPORTED_CODES
 
 
-# EIO from `launchctl bootstrap` can mean the label is already registered. Check
-# whether it is running before treating that registration as stale.
+# EIO from `launchctl bootstrap` = label *already* registered (a stale load, or a job still running);
+# recoverable, not an unmanageable domain.
 _LAUNCHCTL_BOOTSTRAP_EIO = 5
 
 
-def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: int = 30) -> None:
-    """Bootstrap a launchd job, recovering from a stale still-registered label (EIO 5).
+def _launchd_print_state(output: str) -> str | None:
+    """The job's own ``state`` in ``launchctl print`` output, from its one top-level (single-tab)
+    ``state =`` line; nested endpoint blocks indent their own ``state = active`` deeper. None when
+    there is not exactly one."""
+    states = [line[len("\tstate = "):].strip() for line in output.splitlines() if line.startswith("\tstate = ")]
+    return states[0] if len(states) == 1 else None
 
-    EIO also occurs when the label is already running. Never boot out a job in
-    that state: update cancellation can reach this path while a healthy gateway
-    has already restarted, and bootout would interrupt its active sessions.
+
+def _launchctl_bootstrap(
+    domain: str, plist_path, label: str, *, timeout: int = 30, leave_running: bool = False
+) -> None:
+    """Bootstrap a launchd job, recovering from a stale still-registered label (EIO 5). Without the
+    bootout + retry that case is misread as an unmanageable domain and degrades to detached, silently
+    losing auto-start and crash-restart.
+
+    EIO also answers a label whose job still runs. *leave_running* (the update resume, whose gateway
+    may still be draining its turns: #138612) leaves a job ``launchctl print`` reports ``state =
+    running`` alone, and clears only a registration it reports otherwise or gone. A job a bootout is
+    still removing lists its old PID under ``state = SIGTERMed``: it is cleared, and its bootstrap
+    fails EIO until launchd has dropped the label. A state it cannot read re-raises the EIO, so the
+    caller keeps its restart debt instead of stopping a gateway that may be busy.
     """
     bootstrap = ["launchctl", "bootstrap", domain, str(plist_path)]
     try:
@@ -112,23 +127,16 @@ def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: int = 
     except subprocess.CalledProcessError as exc:
         if exc.returncode != _LAUNCHCTL_BOOTSTRAP_EIO:
             raise
-        # Only remove the registration when launchctl confirms the job is
-        # stopped or absent. An indeterminate probe is not authority to stop a
-        # potentially busy gateway; let the caller retain its recovery debt.
-        state = subprocess.run(
-            ["launchctl", "print", f"{domain}/{label}"],
-            check=False, timeout=timeout, **_gw()._CAPTURE_TEXT)
-        if state.returncode == 0:
-            running_pid = _gw()._parse_launchd_pid_from_print_output(state.stdout or "")
-            if running_pid is not None:
+        if leave_running:
+            probe = subprocess.run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                check=False, timeout=timeout, **_gw()._CAPTURE_TEXT)
+            state = _launchd_print_state(probe.stdout or "") if probe.returncode == 0 else None
+            if state == "running" and _gw()._parse_launchd_pid_from_print_output(probe.stdout or ""):
                 return
-        elif state.returncode not in {3, 113}:
-            raise RuntimeError(
-                f"launchctl bootstrap for {domain}/{label} returned EIO, and its running state "
-                f"could not be verified (launchctl print exited {state.returncode}); refusing to boot it out"
-            ) from exc
-
-        # Stopped or absent registration — clear it and retry bootstrap.
+            if state in (None, "running") and probe.returncode not in {3, 113}:
+                raise
+        # Stale registration — bootout the leftover label and bootstrap once more.
         # Captured: the bootout is best-effort (a drained job may already be
         # unloaded), so its expected 3/113/125 stderr must not leak to the terminal.
         subprocess.run(

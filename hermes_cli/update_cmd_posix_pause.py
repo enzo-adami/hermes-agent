@@ -369,16 +369,20 @@ def _stop_job(job: dict, *, drained: bool = False) -> None:
 
 def _start_job(job: dict) -> None:
     """Load and start *job*. The invoking profile's plist is regenerated first, as the restart it
-    replaces does (``launchd_restart``); that refresh also loads it."""
+    replaces does (``launchd_restart``); that refresh also loads it. A job that still runs (an update
+    cut short while its gateway drained) is left running, and stays owed until it has exited."""
     from hermes_cli.gateway import (
-        _launchctl_bootstrap, _wait_for_launchd_service_pid, get_launchd_label, refresh_launchd_plist_if_needed,
+        _launchctl_bootstrap, _launchd_print_service_pid, _wait_for_launchd_service_pid, get_launchd_label,
+        refresh_launchd_plist_if_needed,
     )
     if not (job["label"] == get_launchd_label() and refresh_launchd_plist_if_needed()):
-        _launchctl_bootstrap(job["domain"], job["plist"], job["label"])
+        _launchctl_bootstrap(job["domain"], job["plist"], job["label"], leave_running=True)
     subprocess.run(["launchctl", "kickstart", f"{job['domain']}/{job['label']}"],
                    capture_output=True, text=True, encoding="utf-8", errors="replace",
                    stdin=subprocess.DEVNULL, timeout=30, check=False)
     if not _wait_for_launchd_service_pid(job["label"], old_pid=job["pid"], timeout=15.0, domain=job["domain"]):
+        if job["pid"] and _launchd_print_service_pid(job["domain"], job["label"])[1] == job["pid"]:
+            raise RuntimeError(f"{job['label']} still runs its paused gateway (PID {job['pid']})")
         raise RuntimeError(f"{job['label']} did not come back under launchd")
 
 
